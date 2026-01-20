@@ -1,0 +1,967 @@
+// filepath: gemini-text.js
+// DEPRECATED: This file is now a compatibility adapter
+// New code should import directly from core/ and utils/ modules
+
+// Re-export the main orchestration function from refactored core
+const { runGeminiCore } = require('./core/gemini-orchestrator');
+
+// ---------- Public helpers: slash command & mention ----------
+
+async function runGeminiForInteraction(interaction) {
+  const promptText = interaction.options.getString('message', true);
+  const imageAttachment = interaction.options.getAttachment('image') || null;
+  const now = new Date().toISOString();
+
+  try {
+    // ---------- Store current user message in DB ----------
+    const stopStoreUserMessage = startTimer('Store user message', timings);
+    try {
+      await addMessage(channelId, {
+        role: 'user',
+        userId: senderUser.id,
+        content: promptText,
+        timestamp: now,
+      });
+    } finally {
+      stopStoreUserMessage();
+    }
+
+    // ---------- Fetch stored memory from DB ----------
+    // We fetch more than MAX_CONTEXT_MESSAGES so we can both:
+    // - build context (last MAX_CONTEXT_MESSAGES)
+    // - decide when to summarise (if messages.length > SUMMARIZE_THRESHOLD)
+    const fetchLimit = SUMMARIZE_THRESHOLD + MAX_CONTEXT_MESSAGES;
+    let summary = '';
+    let messages = [];
+    const stopFetchMemory = startTimer('Fetch channel memory', timings);
+    try {
+      const memoryPayload = await getChannelMemory(channelId, fetchLimit);
+      summary = memoryPayload.summary;
+      messages = memoryPayload.messages;
+    } finally {
+      stopFetchMemory();
+    }
+
+    // Dynamic context scaling based on prompt length
+    const baseStoredMessages = promptText.length > 500 ? 50 : promptText.length > 200 ? 30 : 15;
+    const recentStoredMessages =
+      messages.length > baseStoredMessages
+        ? messages.slice(-baseStoredMessages)
+        : messages;
+
+    // ---------- Fetch recent raw channel chat ----------
+    let liveChatText = 'No recent raw channel chat.';
+    const liveUserIds = new Set();
+    const liveChatLines = [];
+
+    const stopFetchLiveChat = startTimer('Fetch recent channel chat', timings);
+    try {
+      const liveFetchLimit = promptText.length > 500 ? 30 : promptText.length > 200 ? 20 : 12;
+      const rawMessages = await channel.messages.fetch({ limit: liveFetchLimit });
+
+      const sorted = [...rawMessages.values()].sort(
+        (a, b) => a.createdTimestamp - b.createdTimestamp
+      );
+
+      for (const m of sorted) {
+        if (m.author.bot) continue;
+        if (!m.content || !m.content.trim()) continue;
+        if (m.content.startsWith('/')) continue;
+
+        const ts = new Date(m.createdAt).toISOString();
+        liveUserIds.add(m.author.id);
+
+        let messageLine = `[${ts}] ${m.author.username}: ${m.content}`;
+
+        // Add reply context if message is a reply
+        if (m.reference && m.reference.messageId) {
+          try {
+            const repliedMsg = await channel.messages.fetch(m.reference.messageId).catch(() => null);
+            if (repliedMsg && repliedMsg.author) {
+              const repliedContent = repliedMsg.content ? repliedMsg.content.substring(0, 100) : '(no text)';
+              messageLine += ` [replying to ${repliedMsg.author.username}: "${repliedContent}${repliedMsg.content && repliedMsg.content.length > 100 ? '...' : ''}"]`;
+            }
+          } catch (e) {
+            // Silently ignore if we can't fetch the replied message
+          }
+        }
+
+        liveChatLines.push(messageLine);
+      }
+
+      if (liveChatLines.length) {
+        liveChatText = liveChatLines.join('\n');
+      }
+    } catch (e) {
+      console.error('Failed to fetch recent channel messages:', e);
+    } finally {
+      stopFetchLiveChat();
+    }
+
+    // ---------- Build userInfoMap for all known users ----------
+    const recentStoredUserIds = new Set(
+      recentStoredMessages
+        .filter(m => m.userId)
+        .map(m => m.userId)
+    );
+
+    const allUserIds = new Set([
+      ...recentStoredUserIds,
+      ...liveUserIds,
+      senderUser.id,
+    ]);
+
+    // ---------- Fetch guild-level memory (summary + users JSON) ----------
+    let guildMemory = { summary: '', users: '[]' };
+    let guildUsers = [];
+    const storedGuildUserById = new Map();
+
+    if (guild) {
+      const cachedGuild = getCachedGuildMemory(guild.id);
+      if (cachedGuild) {
+        guildMemory = cachedGuild;
+        debugLog('Using cached guild memory for guild', guild.id);
+      } else {
+        const stopFetchGuildMemory = startTimer('Fetch guild memory', timings);
+        try {
+          guildMemory = await getGuildMemory(guild.id);
+          setCachedGuildMemory(guild.id, guildMemory);
+        } catch (e) {
+          console.error('Failed to fetch guild memory:', e);
+        } finally {
+          stopFetchGuildMemory();
+        }
+      }
+
+      try {
+        guildUsers = JSON.parse(guildMemory.users || '[]');
+      } catch (e) {
+        guildUsers = [];
+      }
+
+      // Map stored guildUsers by id for quick lookup (notes may be present)
+      for (const u of guildUsers || []) {
+        if (!u || !u.id) continue;
+        storedGuildUserById.set(String(u.id), u);
+      }
+    }
+
+    /** @type {Record<string, { id: string, username: string, displayName: string, nickname: string | null }>} */
+    const userInfoMap = {};
+
+    const stopBuildUserInfoMap = startTimer('Build user info map', timings);
+    try {
+      if (guild) {
+        for (const id of allUserIds) {
+          if (userInfoMap[id]) continue;
+
+          try {
+            let member = guild.members?.cache?.get(id) || null;
+            if (!member) {
+              member = await guild.members.fetch(id);
+            }
+            const user = member.user;
+
+            const username = user.username;
+            const displayName =
+              member.displayName || user.globalName || user.username;
+            const nickname = member.nickname || null;
+            const roles = member.roles?.cache ? member.roles.cache.map(r => r.name) : [];
+            const tag = user.tag;
+            const avatar = user.displayAvatarURL?.({ size: 128 }) || null;
+            // Try multiple common properties where a bio/about may be stored by different discord.js versions
+            let bio = null;
+            try {
+              bio = user.bio ?? user.profile?.bio ?? user.about ?? null;
+            } catch (e) {
+              bio = null;
+            }
+
+            // Optional debug: log which profile-like fields exist when debug mode is enabled
+            if (DEBUG_GEMINI) {
+              try {
+                const sample = bio ? (bio.length > 200 ? bio.slice(0, 200) + '…' : bio) : null;
+                debugLog(`Fetched user ${id} - bioPresent=${!!bio}, bioSample=${sample}`);
+              } catch (e) {
+                // ignore logging errors
+              }
+            }
+
+            userInfoMap[id] = {
+              id,
+              username,
+              displayName,
+              nickname,
+              roles,
+              tag,
+              avatar,
+              bio,
+              note: storedGuildUserById.get(String(id))?.note ?? null,
+            };
+          } catch {
+            if (id === senderUser.id) {
+              const su = senderUser;
+              userInfoMap[id] = {
+                id,
+                username: su.username,
+                displayName:
+                  su.displayName || su.globalName || su.username,
+                nickname: null,
+                roles: [],
+                tag: su.tag || `${su.username}#?`,
+                avatar: su.displayAvatarURL?.({ size: 128 }) || null,
+                bio: su.bio || null,
+                note: storedGuildUserById.get(String(id))?.note ?? null,
+              };
+            } else {
+              userInfoMap[id] = {
+                id,
+                username: `User ${id}`,
+                displayName: `User ${id}`,
+                nickname: null,
+                note: storedGuildUserById.get(String(id))?.note ?? null,
+                roles: [],
+                tag: `User#${id}`,
+                avatar: null,
+                bio: null,
+              };
+            }
+          }
+        }
+      } else {
+        // DM, no guild
+        for (const id of allUserIds) {
+          if (userInfoMap[id]) continue;
+
+          if (id === senderUser.id) {
+            userInfoMap[id] = {
+              id,
+              username: senderUser.username,
+              displayName:
+                senderUser.displayName ||
+                senderUser.globalName ||
+                senderUser.username,
+              nickname: null,
+            };
+          } else {
+            userInfoMap[id] = {
+              id,
+              username: `User ${id}`,
+              displayName: `User ${id}`,
+              nickname: null,
+            };
+          }
+        }
+      }
+    } finally {
+      stopBuildUserInfoMap();
+    }
+
+    // Merge stored guildUsers (from guild memory) into userInfoMap when missing
+    for (const u of guildUsers) {
+      if (!u || !u.id) continue;
+      if (userInfoMap[u.id]) continue;
+      userInfoMap[u.id] = {
+        id: u.id,
+        username: u.username || `User ${u.id}`,
+        displayName: u.displayName || u.shortName || u.username || `User ${u.id}`,
+        nickname: u.nickname || null,
+        roles: u.roles || [],
+        tag: u.tag || null,
+        avatar: u.avatar || null,
+        bio: u.bio || null,
+        note: u.note || null,
+      };
+    }
+
+    const formatSpeaker = (m) => {
+      if (m.role === 'assistant') return 'Echo';
+      const info = m.userId ? userInfoMap[m.userId] : null;
+      return info?.displayName || info?.username || (m.userId ? `User ${m.userId}` : 'User');
+    };
+
+    const conversationForSummary = messages
+      .map(m => {
+        const speaker = formatSpeaker(m);
+        const ts =
+          m.timestamp instanceof Date
+            ? m.timestamp.toISOString()
+            : new Date(m.timestamp).toISOString();
+        return `[${ts}] ${speaker}: ${m.content}`;
+      })
+      .join('\n');
+
+    const runMemoryMaintenance = (conversationTranscript) => {
+      const maintenanceTimings = [];
+      const stopMaintenanceTotal = startTimer('Summarize + guild memory maintenance', maintenanceTimings);
+
+      const maintenanceTask = (async () => {
+        try {
+          const summaryPrompt = `
+Summarise the following timestamped Discord channel conversation into a short background summary.
+Keep it under 200 words, include key facts, long-running topics, and user preferences.
+Do NOT invent new information.
+
+Conversation:
+  ${conversationTranscript}
+`.trim();
+
+          let sumRes;
+          const stopGeminiSummaryCall = startTimer('Gemini generateContent (summary)', maintenanceTimings);
+          try {
+            sumRes = await ai.models.generateContent({
+              model: GEMINI_TEXT_MODEL,
+              contents: [{ role: 'user', parts: [{ text: summaryPrompt }] }],
+            });
+          } finally {
+            stopGeminiSummaryCall();
+          }
+
+          let newSummary = sumRes.text ?? '';
+          if (!newSummary && sumRes.candidates) {
+            try {
+              newSummary =
+                sumRes.candidates[0].content.parts
+                  .map(p => p.text || '')
+                  .join(' ')
+                  .trim();
+            } catch {
+              // ignore
+            }
+          }
+
+          const maintenanceOps = [];
+
+          if (newSummary) {
+            maintenanceOps.push((async () => {
+              const stopUpdateChannelSummary = startTimer('Update channel summary', maintenanceTimings);
+              try {
+                await updateChannelSummary(channelId, newSummary);
+              } finally {
+                stopUpdateChannelSummary();
+              }
+            })());
+          }
+
+          maintenanceOps.push((async () => {
+            const stopTruncateMessages = startTimer('Truncate old messages', maintenanceTimings);
+            try {
+              await truncateOldMessages(channelId, MAX_CONTEXT_MESSAGES);
+            } finally {
+              stopTruncateMessages();
+            }
+          })());
+
+          if (guild) {
+            maintenanceOps.push((async () => {
+              const stopUpdateGuildMemory = startTimer('Update guild memory', maintenanceTimings);
+              try {
+                const guildUsersPayload = Object.values(userInfoMap).map(u => ({
+                  id: u.id,
+                  displayName: u.displayName || u.username,
+                  shortName: u.displayName || u.username,
+                  nickname: u.nickname || null,
+                  username: u.username,
+                  roles: u.roles || [],
+                  tag: u.tag || null,
+                  avatar: u.avatar || null,
+                  bio: u.bio || null,
+                  note: u.note || null,
+                }));
+
+                const guildSummary = newSummary || summary || '';
+                await updateGuildMemory(guild.id, guildSummary, JSON.stringify(guildUsersPayload));
+                setCachedGuildMemory(guild.id, {
+                  summary: guildSummary,
+                  users: JSON.stringify(guildUsersPayload),
+                });
+              } catch (e) {
+                console.error('Failed to update guild memory:', e);
+              } finally {
+                stopUpdateGuildMemory();
+              }
+            })());
+          }
+
+          await Promise.all(maintenanceOps);
+        } catch (e) {
+          console.error('Failed to summarize memory:', e);
+        } finally {
+          const total = stopMaintenanceTotal();
+          if (DEBUG_GEMINI) {
+            const sorted = [...maintenanceTimings].sort((a, b) => b.duration - a.duration);
+            debugLog('--- Gemini maintenance timing summary (ms) ---');
+            for (const entry of sorted) {
+              debugLog(`- ${entry.label}: ${entry.duration.toFixed(2)} ms`);
+            }
+            debugLog(`Memory maintenance complete in ${total.toFixed(2)} ms`);
+          }
+        }
+      })();
+
+      maintenanceTask.catch(err => {
+        console.error('Memory maintenance task crashed:', err);
+      });
+
+      return maintenanceTask;
+    };
+
+    // ---------- Stored memory context ----------
+    const stopMemoryContext = startTimer('Build memory context text', timings);
+
+    // Separate channel summary
+    const channelSummaryText = summary || '';
+
+    // Separate chat history
+    const historyLines = [];
+    if (messages.length) {
+      // Build a map of message IDs to messages for quick lookup
+      const messageById = new Map();
+      for (const m of messages) {
+        if (m.messageId) {
+          messageById.set(m.messageId, m);
+        }
+      }
+
+      for (const m of recentStoredMessages) {
+        const speaker = formatSpeaker(m);
+        const ts =
+          m.timestamp instanceof Date
+            ? m.timestamp.toISOString()
+            : new Date(m.timestamp).toISOString();
+
+        let historyLine = `[${ts}] ${speaker}: ${m.content}`;
+
+        // Add reply context if message has replyToMessageId
+        if (m.replyToMessageId && messageById.has(m.replyToMessageId)) {
+          const repliedMsg = messageById.get(m.replyToMessageId);
+          const repliedSpeaker = formatSpeaker(repliedMsg);
+          const repliedContent = repliedMsg.content ? repliedMsg.content.substring(0, 100) : '(no text)';
+          historyLine += ` [replying to ${repliedSpeaker}: "${repliedContent}${repliedMsg.content && repliedMsg.content.length > 100 ? '...' : ''}"]`;
+        }
+
+        historyLines.push(historyLine);
+      }
+    }
+    const chatHistoryText = historyLines.length ? historyLines.join('\n') : 'No stored history yet.';
+
+    stopMemoryContext();
+
+    // ---------- Known users block ----------
+    const stopKnownUsers = startTimer('Build known users block', timings);
+    const knownUsersLines = [];
+    for (const info of Object.values(userInfoMap)) {
+      knownUsersLines.push(
+        `- ID: ${info.id}, Username: ${info.username}, Display name: ${info.displayName}, Nickname: ${info.nickname || '(none)'}, Roles: ${info.roles && info.roles.length ? info.roles.join(', ') : '(none)'
+        }, Bio: ${info.bio || '(none)'}, Note: ${info.note || '(none)'}`
+      );
+    }
+    const knownUsersText = knownUsersLines.join('\n');
+    stopKnownUsers();
+
+    // ---------- Guild memory block (server-level background memory) ----------
+    // Only include guild summary, not user list (redundant with Known Discord users)
+    const stopGuildMemoryBlock = startTimer('Build guild memory block', timings);
+    const guildMemoryText = guild && guildMemory.summary ? guildMemory.summary : '';
+    stopGuildMemoryBlock();
+
+    // ---------- Current sender info ----------
+    const selfInfo = userInfoMap[senderUser.id];
+    const userInfo = `
+- Username: ${selfInfo.username}
+- Display name: ${selfInfo.displayName}
+- Server nickname: ${selfInfo.nickname || '(none set)'}
+- ID: ${selfInfo.id}
+- Server: ${guild ? `${guild.name} (${guild.id})` : 'DM'}
+`.trim();
+
+
+    // ---------- Build parts for Gemini (chat vs action) ----------
+    const stopBuildParts = startTimer('Assemble Gemini request parts', timings);
+    const chatParts = [
+      { name: 'Current sender info', text: userInfo },
+      { name: 'Known Discord users', text: knownUsersText },
+      ...(guildMemoryText
+        ? [{ name: 'Stored guild memory (background context, optional)', text: guildMemoryText }]
+        : []),
+      ...(channelSummaryText
+        ? [{ name: 'Stored channel summary (background context only, use only if relevant)', text: channelSummaryText }]
+        : []),
+      { name: 'Stored chat history (latest first, use only if relevant)', text: chatHistoryText },
+      { name: 'Recent raw channel chat', text: liveChatText },
+    ];
+
+    // Add replied message context if available (chat path)
+    if (repliedMessage && repliedMessage.author) {
+      const repliedAuthor = userInfoMap[repliedMessage.author.id]?.displayName || repliedMessage.author.username;
+      let repliedContext = `${repliedAuthor}: "${repliedMessage.content || '(no text)'}"`;
+
+      if (repliedMessage.attachments && repliedMessage.attachments.size > 0) {
+        const attachmentNames = [...repliedMessage.attachments.values()]
+          .map(att => att.name || 'attachment')
+          .join(', ');
+        repliedContext += `\n(The replied message includes ${repliedMessage.attachments.size} attachment(s): ${attachmentNames})`;
+      }
+
+      chatParts.push({ name: 'User is replying to', text: repliedContext });
+    }
+
+    chatParts.push({
+      name: 'Current user query (respond to this)',
+      text: promptText,
+    });
+
+    // Action flow uses a minimal payload (no history / mode context)
+    const actionParts = [
+      { name: 'User request', text: promptText },
+    ];
+
+    if (repliedMessage && repliedMessage.author) {
+      const repliedAuthor = userInfoMap[repliedMessage.author.id]?.displayName || repliedMessage.author.username;
+      actionParts.push({
+        name: 'Reply context',
+        text: `${repliedAuthor}: "${repliedMessage.content || '(no text)'}"`,
+      });
+    }
+
+    stopBuildParts();
+
+    // Handle all attachments from current message (chat path only)
+    if (attachments && attachments.length > 0) {
+      const stopAttachmentsFetch = startTimer('Fetch attachments', timings);
+
+      const supportedMimeTypes = {
+        'image/jpeg': true,
+        'image/png': true,
+        'image/gif': true,
+        'image/webp': true,
+        'audio/mp3': true,
+        'audio/mpeg': true,
+        'audio/wav': true,
+        'audio/aac': true,
+        'audio/ogg': true,
+        'audio/flac': true,
+        'video/mp4': true,
+        'video/mpeg': true,
+        'video/mov': true,
+        'video/avi': true,
+        'video/x-msvideo': true,
+        'video/webm': true,
+        'video/flv': true,
+        'video/3gpp': true,
+        'application/pdf': true,
+        'text/plain': true,
+        'text/html': true,
+        'text/css': true,
+        'text/javascript': true,
+        'application/x-python': true,
+        'text/x-python': true,
+        'application/json': true,
+        'text/markdown': true,
+        'application/xml': true,
+        'text/xml': true,
+      };
+
+      const getMimeTypeFromName = (filename) => {
+        if (!filename) return null;
+        const lower = filename.toLowerCase();
+
+        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+        if (lower.endsWith('.png')) return 'image/png';
+        if (lower.endsWith('.gif')) return 'image/gif';
+        if (lower.endsWith('.webp')) return 'image/webp';
+        if (lower.endsWith('.mp3')) return 'audio/mpeg';
+        if (lower.endsWith('.wav')) return 'audio/wav';
+        if (lower.endsWith('.aac')) return 'audio/aac';
+        if (lower.endsWith('.ogg')) return 'audio/ogg';
+        if (lower.endsWith('.flac')) return 'audio/flac';
+        if (lower.endsWith('.mp4')) return 'video/mp4';
+        if (lower.endsWith('.mpeg')) return 'video/mpeg';
+        if (lower.endsWith('.mov')) return 'video/mov';
+        if (lower.endsWith('.avi')) return 'video/x-msvideo';
+        if (lower.endsWith('.webm')) return 'video/webm';
+        if (lower.endsWith('.flv')) return 'video/flv';
+        if (lower.endsWith('.3gp')) return 'video/3gpp';
+        if (lower.endsWith('.pdf')) return 'application/pdf';
+        if (lower.endsWith('.txt')) return 'text/plain';
+        if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'text/html';
+        if (lower.endsWith('.css')) return 'text/css';
+        if (lower.endsWith('.js')) return 'text/javascript';
+        if (lower.endsWith('.py')) return 'text/x-python';
+        if (lower.endsWith('.json')) return 'application/json';
+        if (lower.endsWith('.md')) return 'text/markdown';
+        if (lower.endsWith('.xml')) return 'application/xml';
+
+        return null;
+      };
+
+      try {
+        for (const attachment of attachments) {
+          let mimeType = attachment.contentType;
+          if (!mimeType) {
+            mimeType = getMimeTypeFromName(attachment.name);
+          }
+
+          if (!mimeType || !supportedMimeTypes[mimeType]) {
+            console.warn(`Skipping attachment "${attachment.name}" - unsupported MIME type: ${mimeType}`);
+            continue;
+          }
+
+          try {
+            const res = await fetch(attachment.url);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const arrayBuffer = await res.arrayBuffer();
+            const base64 = Buffer.from(arrayBuffer).toString('base64');
+
+            chatParts.push({
+              inlineData: {
+                mimeType: mimeType,
+                data: base64,
+              },
+            });
+          } catch (e) {
+            console.error(`Failed to fetch attachment ${attachment.name}:`, e);
+          }
+        }
+      } finally {
+        stopAttachmentsFetch();
+      }
+    }
+
+    // ---------- Intent detection (chat vs action) ----------
+    let intent = 'chat';
+    try {
+      const intentResult = await ai.models.generateContent({
+        model: GEMINI_TEXT_MODEL,
+        contents: [{ role: 'user', parts: [{ text: promptText }] }],
+        config: {
+          systemInstruction: `You are an intent router for a Discord assistant. Return only the word "action" if the user wants a Discord moderation/administrative action or tool execution (kick, ban, delete messages, manage roles, update bot settings, etc). Return only "chat" for conversation, help, Q&A, small talk, or searches. Do not call tools. Do not add punctuation or extra words.`,
+        },
+      });
+      const intentText = (intentResult.text || '').trim().toLowerCase();
+      if (intentText === 'action') intent = 'action';
+    } catch (e) {
+      console.error('Intent detection failed, defaulting to chat:', e);
+    }
+
+    const chatSystemInstruction = `${SYSTEM_PROMPT}\n\n${TEXT_MODE_CONTEXT}`;
+    const actionSystemInstruction = SYSTEM_PROMPT;
+
+    // ---------- Call Gemini ----------
+    let text = '';
+    let discordMessage = await reply("▌");
+    const stopGeminiReplyCall = startTimer('Gemini generateContent (with tools)', timings);
+
+    try {
+      const isActionFlow = intent === 'action';
+      const initialParts = isActionFlow ? actionParts : chatParts;
+      const initialSystemInstruction = isActionFlow ? actionSystemInstruction : chatSystemInstruction;
+
+      // 1. Initial Call: detect tool usage vs plain text
+      const result = await ai.models.generateContent({
+        model: GEMINI_TOOL_MODEL,
+        contents: [{ role: 'user', parts: initialParts }],
+        config: {
+          systemInstruction: initialSystemInstruction,
+          tools: tools,
+        },
+      });
+
+      const candidate = result.candidates[0];
+      const functionCallPart = candidate?.content?.parts?.find(p => p.functionCall);
+      const aiInitialText = candidate?.content?.parts?.find(p => p.text)?.text || "Processing request...";
+
+      // If we expected an action but the model did not call a tool, fall back to chat mode
+      const shouldFallbackToChat = isActionFlow && !functionCallPart;
+
+      if (shouldFallbackToChat) {
+        const streamResult = await ai.models.generateContentStream({
+          model: GEMINI_TOOL_MODEL,
+          contents: [{ role: 'user', parts: chatParts }],
+          config: {
+            systemInstruction: chatSystemInstruction,
+            tools: tools,
+          },
+        });
+
+        text = await handleStreamingResponse(streamResult, discordMessage);
+      }
+      else if (functionCallPart) {
+        const { name, args } = functionCallPart.functionCall;
+
+        const requiredPerm = functionPermissions?.[name];
+
+        if (requiredPerm) {
+          const actionName = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+          const confirmEmbed = new EmbedBuilder()
+            .setTitle('⚠️ Action Confirmation')
+            .setColor(0xFFA500)
+            .setDescription(`**Action:** ${actionName}\n**Target:** ${JSON.stringify(args, null, 2)}`)
+            .setFooter({ text: `Requires Permission: ${requiredPerm}` });
+
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('confirm_action').setLabel('Confirm').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('cancel_action').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+          );
+
+          await discordMessage.edit({
+            content: aiInitialText,
+            embeds: [confirmEmbed],
+            components: [row],
+          });
+
+          const collector = discordMessage.createMessageComponentCollector({
+            componentType: ComponentType.Button,
+            time: 60000,
+          });
+
+          await new Promise((resolve) => {
+            collector.on('collect', async (i) => {
+              if (i.user.id !== senderUser.id) {
+                return i.reply({ content: "⛔ This isn't your request.", ephemeral: true });
+              }
+
+              if (!i.member.permissions.has(requiredPerm)) {
+                return i.reply({ content: `⛔ You lack the **${requiredPerm}** permission.`, ephemeral: true });
+              }
+
+              if (i.customId === 'confirm_action') {
+                await i.deferUpdate();
+
+                try {
+                  // Get the member with proper permissions
+                  const member = await guild.members.fetch(senderUser.id).catch(() => null);
+                  const functionResult = await executeFunctionCall(name, args, { channel, guild, member });
+
+                  const secondResult = await ai.models.generateContentStream({
+                    model: GEMINI_TOOL_MODEL,
+                    contents: [
+                      { role: 'user', parts: initialParts },
+                      candidate.content,
+                      { role: 'function', parts: [{ functionResponse: { name, response: { content: functionResult } } }] }
+                    ],
+                    config: {
+                      systemInstruction: initialSystemInstruction,
+                      tools: tools,
+                    },
+                  });
+
+                  text = await handleStreamingResponse(secondResult, discordMessage, { embeds: [], components: [] });
+                } catch (err) {
+                  text = "❌ Error executing action.";
+                  await discordMessage.edit({ content: text, embeds: [], components: [] });
+                  console.error(err);
+                }
+                collector.stop('confirmed');
+                resolve();
+
+              } else if (i.customId === 'cancel_action') {
+                await i.update({ content: '❌ Action cancelled.', embeds: [], components: [] });
+                text = 'Action cancelled.';
+                collector.stop('cancelled');
+                resolve();
+              }
+            });
+
+            collector.on('end', async (collected, reason) => {
+              if (reason === 'time') {
+                await discordMessage.edit({ content: 'clock: Confirmation timed out.', embeds: [], components: [] });
+                text = 'Confirmation timed out.';
+                resolve();
+              }
+            });
+          });
+
+        } else {
+          // Get the member with proper permissions
+          const member = await guild.members.fetch(senderUser.id).catch(() => null);
+          const functionResult = await executeFunctionCall(name, args, { channel, guild, member });
+
+          const secondResult = await ai.models.generateContentStream({
+            model: GEMINI_TOOL_MODEL,
+            contents: [
+              { role: 'user', parts: initialParts },
+              candidate.content,
+              { role: 'function', parts: [{ functionResponse: { name, response: { content: functionResult } } }] }
+            ],
+            config: {
+              systemInstruction: initialSystemInstruction,
+              tools: tools,
+            },
+          });
+
+          text = await handleStreamingResponse(secondResult, discordMessage);
+        }
+
+      } else {
+        const streamResult = await ai.models.generateContentStream({
+          model: GEMINI_TOOL_MODEL,
+          contents: [{ role: 'user', parts: chatParts }],
+          config: {
+            systemInstruction: chatSystemInstruction,
+            tools: tools,
+          },
+        });
+
+        text = await handleStreamingResponse(streamResult, discordMessage);
+      }
+
+    } catch (err) {
+      console.error('Gemini Error:', err);
+      if (discordMessage) await discordMessage.edit('❌ Error talking to Echo.').catch(() => null);
+    } finally {
+      stopGeminiReplyCall();
+    }
+
+    if (!text) text = 'Echo didn\'t return any text.';
+    if (text.length > 1900) text = text.slice(0, 1900) + '…';
+
+    const replyTimestamp = new Date().toISOString();
+
+    // Store assistant reply (use bot user id so assistant messages are attributed)
+    const botUserId = channel?.client?.user?.id || null;
+    const stopStoreAssistantMessage = startTimer('Store assistant reply', timings);
+    try {
+      await addMessage(channelId, {
+        role: 'assistant',
+        userId: botUserId,
+        content: text,
+        timestamp: replyTimestamp,
+      });
+    } finally {
+      stopStoreAssistantMessage();
+    }
+
+    // Production log of the user prompt and AI response for observability
+    try {
+      const sanitizeForLog = (value) =>
+        typeof value === 'string'
+          ? value.replace(/[\r\n]+/g, ' ').replace(/\s\s+/g, ' ').trim()
+          : String(value ?? '');
+
+      const guildInfo = guild ? `${guild.name} (${guild.id})` : 'DM';
+      const channelInfo = channel?.name || channel?.id || 'unknown-channel';
+      const userInfo = senderUser?.tag || senderUser?.username || senderUser?.id || 'unknown-user';
+      const logPrompt = sanitizeForLog(promptText);
+      const logResponse = sanitizeForLog(text);
+
+      const infoMessage = `Guild=${guildInfo} | Channel=${channelInfo} | User=${userInfo} | Prompt="${logPrompt}" | Response="${logResponse}"`;
+      console.info(`[Gemini Session] ${infoMessage}`);
+    } catch (logErr) {
+      console.error('Failed to log Gemini session:', logErr);
+    }
+
+    // ---------- Schedule summarization & guild memory maintenance (async) ----------
+    if (DEBUG_GEMINI) {
+      debugLog('Scheduling memory maintenance task');
+    }
+    runMemoryMaintenance(conversationForSummary);
+
+    // const stopSendReply = startTimer('Send Discord reply', timings);
+    // try {
+    //   await reply(text);
+    // } finally {
+    //   stopSendReply();
+    // }
+
+  } finally {
+    const totalDuration = stopTotalTimer();
+    if (DEBUG_GEMINI) {
+      const sortedTimings = [...timings].sort((a, b) => b.duration - a.duration);
+      debugLog('--- Gemini timing summary (ms) ---');
+      for (const entry of sortedTimings) {
+        debugLog(`- ${entry.label}: ${entry.duration.toFixed(2)} ms`);
+      }
+      debugLog(`Gemini run complete in ${totalDuration.toFixed(2)} ms\n\n\n`);
+    }
+  }
+}
+
+// Helper to handle streaming and UI updates
+async function handleStreamingResponse(streamResult, message, options = {}) {
+  let finalText = '';
+  try {
+    for await (const chunk of streamResult) {
+      const chunkText = chunk.text || '';
+      finalText += chunkText;
+
+      // Update message periodically (simple debounce could be added here)
+      // We merge 'options' to allow clearing embeds/components
+      if (finalText.length > 0 && finalText.length % 50 === 0) {
+        await message.edit({ content: finalText, ...options }).catch(() => { });
+      }
+    }
+    // Final update
+    await message.edit({ content: finalText, ...options }).catch(async (err) => {
+      // If message was deleted or not found (10008), reply instead
+      if (err.code === 10008 || err.status === 404) {
+        console.warn('Original message not found, replying with new message instead');
+        try {
+          await message.channel.send(finalText);
+        } catch (replyErr) {
+          console.error('Failed to send fallback message:', replyErr);
+        }
+      } else {
+        throw err;
+      }
+    });
+  } catch (e) {
+    console.error('Error streaming response:', e);
+    // If stream fails, try to edit or reply with what we got
+    if (finalText) {
+      await message.edit({ content: finalText, ...options }).catch(async (err) => {
+        if (err.code === 10008 || err.status === 404) {
+          try {
+            await message.channel.send(finalText);
+          } catch (replyErr) {
+            console.error('Failed to send fallback message:', replyErr);
+          }
+        }
+      });
+    }
+  }
+  return finalText;
+}
+
+// ---------- Public helpers: slash command & mention ----------
+
+async function runGeminiForInteraction(interaction) {
+  const promptText = interaction.options.getString('message', true);
+  const imageAttachment = interaction.options.getAttachment('image') || null;
+  const attachments = imageAttachment ? [imageAttachment] : [];
+
+  await runGeminiCore({
+    channel: interaction.channel,
+    guild: interaction.guild,
+    senderUser: interaction.user,
+    promptText,
+    attachments,
+    repliedMessage: null,
+    reply: async (content) => {
+      return await interaction.editReply(content);
+    },
+  });
+}
+
+async function runGeminiForMessage(message, promptText, attachments = [], repliedMessage = null) {
+  await runGeminiCore({
+    channel: message.channel,
+    guild: message.guild,
+    senderUser: message.author,
+    promptText,
+    attachments,
+    repliedMessage,
+    reply: async (content) => {
+      return await message.reply({
+        content,
+        allowedMentions: { repliedUser: true },
+      });
+    },
+  });
+}
+
+module.exports = {
+  runGeminiForInteraction,
+  runGeminiForMessage,
+};

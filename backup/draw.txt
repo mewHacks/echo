@@ -1,0 +1,71 @@
+// commands/draw.js
+const { SlashCommandBuilder, AttachmentBuilder } = require('discord.js');
+const { GoogleGenAI } = require('@google/genai');
+
+module.exports = {
+     data: new SlashCommandBuilder()
+          .setName('draw')
+          .setDescription('Generate an image using Gemini.')
+          .addStringOption(option =>
+               option.setName('prompt')
+                    .setDescription('What image should I generate?')
+                    .setRequired(true)
+          ),
+
+     async execute(interaction) {
+          const prompt = interaction.options.getString('prompt');
+          await interaction.deferReply();
+
+          const apiKey = process.env.GEMINI_API_KEY;
+
+          if (!apiKey) {
+               await interaction.editReply('❌ Missing GEMINI_API_KEY in `.env`.');
+               return;
+          }
+
+          try {
+               // Initialize Gemini client
+               const genAI = new GoogleGenAI({apiKey});
+               // genAI.setApiKey(apiKey);
+
+               // Generate image
+               const result = await genAI.models.generateContent({
+                    model: "gemini-2.5-flash-image",
+                    contents: prompt,
+               });
+
+               console.log("Gemini image generation result:", result);
+
+
+               // Extract base64 data
+               const base64Image =
+                    result.images?.[0]?.imageBytes ||
+                    result.responses?.[0]?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+               if (!base64Image) {
+                    console.error(result);
+                    return interaction.editReply("❌ No image returned from Gemini.");
+               }
+
+               const buffer = Buffer.from(base64Image, "base64");
+
+               await interaction.editReply({
+                    content: `🎨 **Generated image:** \`${prompt}\``,
+                    files: [new AttachmentBuilder(buffer, { name: "generated.png" })]
+               });
+
+          } catch (err) {
+               console.error("Gemini error:", err);
+
+               // Nice error for quota limits
+               if (err.message?.includes("quota") || err.toString().includes("RESOURCE_EXHAUSTED")) {
+                    return interaction.editReply(
+                         "❌ You have **0 free quota** for image generation.\n" +
+                         "Enable billing in Google AI Studio to use `/draw`."
+                    );
+               }
+
+               await interaction.editReply("❌ Error generating image. Check console for details.");
+          }
+     },
+};

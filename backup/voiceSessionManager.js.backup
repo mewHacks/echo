@@ -1,0 +1,1175 @@
+// voiceSessionManager.js
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  NoSubscriberBehavior,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  entersState,
+  EndBehaviorType,
+  StreamType,
+} = require('@discordjs/voice');
+const { ChannelType } = require('discord.js');
+const prism = require('prism-media');
+const { Readable, PassThrough } = require('node:stream');
+const { connectLiveSession } = require('./gemini-live');
+const { getGeminiClient } = require('./gemini-client');
+const { GEMINI_TRANSCRIBE_MODEL, GEMINI_VOICE_NAME } = require('./config');
+
+const VOICE_READY_TIMEOUT = 15_000;
+const sessions = new Map();
+const PCM_MIME_TYPE = 'audio/pcm;rate=48000';
+const STAGE_SPEAK_PROMPT = 'Discord still suppresses Echo in this stage channel. Please use "Invite to Speak" or grant the bot Stage Moderator permissions so its audio can be heard.';
+const IDLE_TIMEOUT_MS = 60_000;
+const CALL_END_TOKEN = '[ECHO_CALL_END]';
+const CALL_END_INSTRUCTION = `CRITICAL: When a user asks you to leave, hang up, or end the call, your spoken goodbye MUST include the phrase "${CALL_END_TOKEN}" so the system can detect the hangup request. Without this exact token, the bot will not disconnect.`;
+const MAX_TRANSCRIPTION_BYTES = 1_500_000;
+const MIN_TRANSCRIPTION_BYTES = 6_000;
+const TRANSCRIPTION_PROMPT = 'Transcribe this Discord voice audio exactly as text. Return only what the speaker said.';
+
+const DEBUG_GEMINI_VOICE = (() => {
+  const raw = process.env.DEBUG_GEMINI ?? process.env.DEBUG_Echo ?? '';
+  if (typeof raw === 'string') {
+    const normalized = raw.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  return Boolean(raw);
+})();
+const debugVoice = (...args) => {
+  if (!DEBUG_GEMINI_VOICE) return;
+  console.log('[VoiceSession DEBUG]', ...args);
+};
+
+class VoiceSession {
+  constructor({ voiceChannel, initiatedBy, voiceName }) {
+    this.voiceChannel = voiceChannel;
+    this.initiatedBy = initiatedBy;
+    this.voiceName = voiceName || GEMINI_VOICE_NAME;
+    this.connection = null;
+    this.audioPlayer = null;
+
+    this.receiverStreams = new Map();
+    this.liveSession = null;
+    this.destroyed = false;
+    this.botUserId = voiceChannel.client?.user?.id ?? null;
+    this.setupComplete = false;
+    this.initialInstructionsSent = false;
+    this.lastAudioTs = 0;
+    this.currentResponseStream = null;
+    this.idleTimer = null;
+    this.audioEndTimer = null;
+    this.sessionEndRequested = false;
+    this.awaitingGoodbyeResponse = false;
+    this.pendingDestroyReason = null;
+    this.destroyAfterPlaybackHandle = null;
+    this.goodbyeTimeoutHandle = null;
+    this.transcriptionClient = null;
+    this.activeSpeakerId = null;
+  }
+
+  async start() {
+    await this.joinChannel();
+    await this.connectGemini();
+    this.setupReceiver();
+    debugVoice(`Voice session ready in ${this.voiceChannel.name}`);
+  }
+
+  async joinChannel() {
+    this.connection = joinVoiceChannel({
+      channelId: this.voiceChannel.id,
+      guildId: this.voiceChannel.guild.id,
+      adapterCreator: this.voiceChannel.guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+    this.connection.on('stateChange', (oldState, newState) => {
+      if (this.destroyed) return;
+      if (newState.status === VoiceConnectionStatus.Disconnected) {
+        void this.destroy('Voice connection closed.');
+      }
+    });
+
+    await entersState(this.connection, VoiceConnectionStatus.Ready, VOICE_READY_TIMEOUT);
+
+    this.audioPlayer = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Stop,
+      },
+    });
+
+    this.audioPlayer.on('stateChange', (oldState, newState) => {
+      if (this.destroyed) return;
+      debugVoice('Audio player state change', oldState.status, '->', newState.status);
+    });
+
+    this.audioPlayer.on('error', (error) => {
+      console.error('[VoiceSession] Audio player error:', error);
+    });
+
+    this.connection.subscribe(this.audioPlayer);
+    await this.ensureSpeakingPermissions();
+  }
+
+  async connectGemini() {
+    const guild = this.voiceChannel.guild;
+    const contextLines = [
+      'Voice session metadata:',
+      `- Server: ${guild.name} (${guild.id})`,
+      `- Voice channel: ${this.voiceChannel.name} (${this.voiceChannel.id})`,
+      `- Initiated by: ${this.initiatedBy.tag ?? this.initiatedBy.username} (${this.initiatedBy.id})`,
+      'Mode context: Echo supports both text chat (/chat or mentioning @Echo in a text channel) and live voice chat (join a voice channel and run /join). You are currently in the live VOICE session, so respond with speech audio while keeping the text option in mind if users ask about it.',
+      'You are speaking live with multiple Discord users. Keep replies short, speech-friendly, and acknowledge the speaker by name when possible.',
+      'Each turn should be a single concise spoken response — do not repeat the same sentence twice or restate the same idea back-to-back.',
+      'End each spoken response cleanly—never repeat the final word or phrase out loud unless a user explicitly said it that way. If you need emphasis, choose different words.',
+      CALL_END_INSTRUCTION,
+      'When a user says things like "goodbye", "you can leave", or explicitly asks you to hang up, confirm politely and end the call immediately. Your goodbye MUST clearly state that you are disconnecting and MUST include the token described above so the automation can detect it instantly.',
+    ].join('\n');
+
+    const callbacks = {
+      onopen: () => {
+        debugVoice('Gemini Live link established.');
+        this.sendInitialInstructions();
+      },
+      onmessage: (message) => {
+        this.handleServerMessage(message);
+      },
+      onerror: (error) => {
+        console.error('[VoiceSession] Gemini Live error:', error);
+      },
+      onclose: (event) => {
+        const details = describeCloseEvent(event);
+        console.warn('[VoiceSession] Gemini Live socket closed.', details);
+        void this.destroy(`Gemini Live session closed${details ? ` (${details})` : ''}`);
+      },
+    };
+
+    const speechConfig = this.voiceName
+      ? {
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: this.voiceName,
+            },
+          },
+        },
+      }
+      : undefined;
+
+    this.liveSession = await connectLiveSession({
+      extraPromptContext: contextLines,
+      callbacks,
+      config: speechConfig,
+    });
+  }
+
+  async ensureSpeakingPermissions() {
+    const me = this.voiceChannel.guild.members.me;
+    if (!me?.voice) {
+      debugVoice('No voice state available for bot member.');
+      return;
+    }
+
+    debugVoice('Voice state before permission check', {
+      mute: me.voice.mute,
+      selfMute: me.voice.selfMute,
+      suppressed: me.voice.suppressed,
+      channelType: this.voiceChannel.type,
+    });
+
+    if (me.voice.mute || me.voice.selfMute) {
+      try {
+        await me.voice.setMute(false, 'Enable Gemini voice playback');
+        debugVoice('Cleared server/self mute state.');
+      } catch (error) {
+        console.warn('[VoiceSession] Failed to clear mute state:', error);
+      }
+    }
+
+    if (this.voiceChannel.type === ChannelType.GuildStageVoice && me.voice.suppressed) {
+      try {
+        if (typeof me.voice.setSuppressed === 'function') {
+          await me.voice.setSuppressed(false);
+          debugVoice('Unsuppressed bot in stage channel.');
+        } else if (typeof me.voice.setRequestToSpeak === 'function') {
+          await me.voice.setRequestToSpeak(true);
+          debugVoice('Requested to speak in stage channel.');
+        }
+      } catch (error) {
+        console.warn('[VoiceSession] Failed to unsuppress bot in stage channel:', error);
+        console.warn('[VoiceSession]', STAGE_SPEAK_PROMPT);
+      }
+
+      if (me.voice.suppressed) {
+        debugVoice('Bot remains suppressed after unsuppress attempt.');
+        console.warn('[VoiceSession]', STAGE_SPEAK_PROMPT);
+      }
+    }
+  }
+
+  setupReceiver() {
+    const receiver = this.connection.receiver;
+
+    receiver.speaking.on('start', (userId) => {
+      if (this.destroyed) return;
+      if (this.botUserId && userId === this.botUserId) return;
+      debugVoice('Speaking start detected', { userId });
+      console.log('[VOICE] Speaking start:', userId);
+      this.resetIdleTimer('user-speaking');
+      this.handleSpeakerStart(userId);
+      if (!this.receiverStreams.has(userId)) {
+        this.subscribeToUser(userId);
+      }
+      const payload = this.receiverStreams.get(userId);
+      if (payload) {
+        payload.isSpeaking = true;
+        payload.hasData = false;
+      }
+    });
+
+    receiver.speaking.on('end', (userId) => {
+      if (this.destroyed) return;
+      debugVoice('Speaking end detected', { userId });
+      if (this.activeSpeakerId === userId) {
+        debugVoice('Clearing active speaker on end', { userId });
+        this.activeSpeakerId = null;
+      }
+      const payload = this.receiverStreams.get(userId);
+      if (payload) {
+        payload.isSpeaking = false;
+        if (payload.hasData) {
+          payload.hasData = false;
+          // this.signalAudioStreamEnd('user-stop'); // Removed in favor of silence timeout
+          void this.processUserTranscription(userId, payload);
+        }
+      }
+    });
+  }
+
+  subscribeToUser(userId) {
+    try {
+      debugVoice('Subscribing to user audio stream', { userId });
+      const opusStream = this.connection.receiver.subscribe(userId, {
+        end: {
+          behavior: EndBehaviorType.Manual,
+        },
+      });
+
+      const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 1, rate: 48000 });
+      const payload = {
+        opusStream,
+        decoder,
+        hasData: false,
+        isSpeaking: false,
+        createdAt: Date.now(),
+        transcriptionBuffers: [],
+        transcriptionByteLength: 0,
+      };
+
+      opusStream.on('error', (error) => {
+        console.error(`[VoiceSession] Opus stream error for ${userId}:`, error);
+        this.stopUserStream(userId, payload);
+      });
+      const handleStreamClosed = (reason) => {
+        debugVoice(`Opus stream ${reason}`, { userId, hasData: payload.hasData });
+        this.stopUserStream(userId, payload);
+      };
+      opusStream.on('end', () => handleStreamClosed('ended'));
+      opusStream.on('close', () => handleStreamClosed('closed'));
+      decoder.on('error', (error) => {
+        console.error(`[VoiceSession] Decoder error for ${userId}:`, error);
+        this.stopUserStream(userId, payload);
+      });
+
+      opusStream.pipe(decoder);
+      decoder.on('data', (chunk) => {
+        console.log('[VOICE] PCM bytes:', chunk.length);
+        if (!payload.isSpeaking) {
+          payload.isSpeaking = true;
+        }
+        payload.hasData = true;
+        if (payload.transcriptionByteLength < MAX_TRANSCRIPTION_BYTES) {
+          payload.transcriptionBuffers.push(Buffer.from(chunk));
+          payload.transcriptionByteLength += chunk.length;
+        }
+        this.handleAudioChunkFromUser(userId, chunk);
+      });
+
+      this.receiverStreams.set(userId, payload);
+    } catch (error) {
+      console.error(`[VoiceSession] Failed to subscribe to user ${userId}:`, error);
+    }
+  }
+
+  handleSpeakerStart(userId) {
+    if (this.destroyed) return;
+    if (this.activeSpeakerId && this.activeSpeakerId !== userId) {
+      debugVoice('Speaker switch detected, signaling end of previous stream', {
+        from: this.activeSpeakerId,
+        to: userId,
+      });
+      this.signalAudioStreamEnd('speaker-switch');
+    }
+    if (this.activeSpeakerId !== userId) {
+      this.activeSpeakerId = userId;
+    }
+  }
+
+  handleAudioChunkFromUser(userId, chunk) {
+    if (this.destroyed) return;
+    if (this.activeSpeakerId !== userId) {
+      return; // Drop overlapping speaker audio to avoid jamming Gemini
+    }
+
+    this.lastAudioTs = Date.now();
+    this.forwardPcmChunk(chunk);
+
+    if (this.audioEndTimer) {
+      clearTimeout(this.audioEndTimer);
+    }
+
+    this.audioEndTimer = setTimeout(() => {
+      if (Date.now() - this.lastAudioTs >= 700) {
+        this.signalAudioStreamEnd('silence');
+      }
+    }, 750);
+  }
+
+  stopUserStream(userId, expectedPayload) {
+    const currentPayload = this.receiverStreams.get(userId);
+
+    if (expectedPayload && currentPayload && currentPayload !== expectedPayload) {
+      debugVoice('Discarding stale user stream payload', {
+        userId,
+        hasData: expectedPayload.hasData,
+        currentHasData: currentPayload.hasData,
+      });
+      cleanupUserStream(expectedPayload);
+      return;
+    }
+
+    const payload = currentPayload ?? expectedPayload;
+    if (!payload) return;
+
+    cleanupUserStream(payload);
+
+    if (currentPayload === payload) {
+      this.receiverStreams.delete(userId);
+      if (payload.hasData) {
+        payload.hasData = false;
+        this.signalAudioStreamEnd('user-stop');
+        void this.processUserTranscription(userId, payload);
+      } else {
+        debugVoice('User stream ended with no audio', { userId });
+      }
+    }
+  }
+
+  async processUserTranscription(userId, payload) {
+    if (this.destroyed) {
+      return;
+    }
+    if (!payload?.transcriptionBuffers?.length) {
+      return;
+    }
+
+    const buffers = payload.transcriptionBuffers;
+    payload.transcriptionBuffers = [];
+    const byteLength = payload.transcriptionByteLength || 0;
+    payload.transcriptionByteLength = 0;
+
+    if (!buffers.length || byteLength < MIN_TRANSCRIPTION_BYTES) {
+      return;
+    }
+
+    const pcmBuffer = Buffer.concat(buffers);
+    try {
+      const transcript = await this.transcribePcmBuffer(pcmBuffer);
+      if (!transcript) {
+        return;
+      }
+      debugVoice('User speech transcription', { userId, transcript });
+      if (textRequestsHangup(transcript)) {
+        this.handleHangupRequest('user-voice', transcript);
+      }
+    } catch (error) {
+      console.error('[VoiceSession] Failed to transcribe user audio:', error);
+    }
+  }
+
+  async transcribePcmBuffer(pcmBuffer) {
+    if (!GEMINI_TRANSCRIBE_MODEL) {
+      return '';
+    }
+    if (!pcmBuffer || pcmBuffer.length < MIN_TRANSCRIPTION_BYTES) {
+      return '';
+    }
+
+    if (!this.transcriptionClient) {
+      try {
+        this.transcriptionClient = getGeminiClient();
+      } catch (error) {
+        console.error('[VoiceSession] Failed to init Gemini client for transcription:', error);
+        return '';
+      }
+    }
+
+    const wavBuffer = buildWavBufferFromPcm({
+      pcmBuffer,
+      sampleRate: 48000,
+      channels: 1,
+    });
+
+    try {
+      const response = await this.transcriptionClient.models.generateContent({
+        model: GEMINI_TRANSCRIBE_MODEL,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: TRANSCRIPTION_PROMPT },
+              { inlineData: { mimeType: 'audio/wav', data: wavBuffer.toString('base64') } },
+            ],
+          },
+        ],
+      });
+      return extractTextFromGenerateResponse(response).trim();
+    } catch (error) {
+      console.error('[VoiceSession] Gemini transcription request failed:', error);
+      return '';
+    }
+  }
+
+  forwardPcmChunk(chunk) {
+    if (!this.liveSession || this.destroyed || !chunk || chunk.length === 0) {
+      return;
+    }
+
+    try {
+      debugVoice('Forwarding PCM chunk to Gemini', { bytes: chunk.length });
+      const base64Data = Buffer.isBuffer(chunk)
+        ? chunk.toString('base64')
+        : Buffer.from(chunk).toString('base64');
+      this.liveSession.sendRealtimeInput({
+        audio: {
+          mimeType: PCM_MIME_TYPE,
+          data: base64Data,
+        },
+      });
+    } catch (error) {
+      console.error('[VoiceSession] Failed to stream PCM chunk to Gemini:', error);
+    }
+  }
+
+  signalAudioStreamEnd(context = 'manual') {
+    if (!this.liveSession || this.destroyed) {
+      return;
+    }
+
+    try {
+      debugVoice('Signaling Gemini audioStreamEnd', { context });
+      this.liveSession.sendRealtimeInput({ audioStreamEnd: true });
+    } catch (error) {
+      console.error('[VoiceSession] Failed to signal audioStreamEnd:', error);
+    }
+  }
+
+  handleServerMessage(message) {
+    if (message.setupComplete) {
+      this.setupComplete = true;
+    }
+
+    if (message.goAway) {
+      const reason = message.goAway?.reason || 'server requested disconnect';
+      console.warn('[VoiceSession] Gemini server requested to end this session:', reason);
+      void this.destroy('Gemini goAway signal.');
+      return;
+    }
+
+    if (message.toolCall) {
+      console.warn('[VoiceSession] Gemini requested a function call (unsupported in voice mode).');
+    }
+
+    const rawContent = message.serverContent;
+    if (!rawContent) return;
+
+    const contents = Array.isArray(rawContent) ? rawContent : [rawContent];
+    debugVoice('Received serverContent batch', contents.length);
+    console.log(`[VOICE DEBUG] Processing ${contents.length} content items`);
+    for (const content of contents) {
+      if (!content) continue;
+
+      if (content.interrupted) {
+        this.flushPlayback('Gemini interrupted earlier audio.');
+      }
+
+      const rawTranscript = content.inputTranscription?.text;
+      const transcript = typeof rawTranscript === 'string' ? rawTranscript.trim() : '';
+      if (transcript) {
+        debugVoice('Input transcription received', transcript);
+        if (!this.sessionEndRequested && textRequestsHangup(transcript)) {
+          this.handleHangupRequest('user-voice', transcript);
+        }
+      }
+
+      const modelTurn = content.modelTurn ?? content;
+      if (modelTurn?.parts?.length) {
+        this.logModelTurnParts(modelTurn);
+        for (const part of modelTurn.parts) {
+          this.handleModelPart(part);
+        }
+      }
+
+      if (content.turnComplete) {
+        debugVoice('Turn complete signaled.');
+        console.log(`[VOICE DEBUG] Turn complete - closing stream`);
+        if (this.currentResponseStream) {
+          try {
+            this.currentResponseStream.removeAllListeners();
+            this.currentResponseStream.end();
+            this.currentResponseStream.destroy();
+          } catch (e) {
+            console.error('[VoiceSession] Error cleaning up stream:', e);
+          }
+          this.currentResponseStream = null;
+        }
+      }
+    }
+    this.resetIdleTimer('model-response');
+  }
+
+  logModelTurnParts(modelTurn) {
+    if (!DEBUG_GEMINI_VOICE || !modelTurn?.parts) {
+      return;
+    }
+    const descriptors = modelTurn.parts.map((part) => {
+      if (part?.text) {
+        const preview = part.text.length > 60 ? `${part.text.slice(0, 57)}...` : part.text;
+        return `text:"${preview}"`;
+      }
+      if (part?.inlineData?.data) {
+        const size = part.inlineData.data.length;
+        return `audio:${part.inlineData.mimeType || 'unknown'} (${size}b base64)`;
+      }
+      return 'other-part';
+    });
+    debugVoice('Model turn parts', descriptors.join(', '));
+  }
+
+  handleModelPart(part) {
+    if (!part) return;
+
+    if (part.text) {
+      this.handleTextPart(part.text);
+    }
+
+    if (part.inlineData?.data) {
+      const buffer = Buffer.from(part.inlineData.data, 'base64');
+      console.log(`[VOICE DEBUG] Received audio chunk: ${buffer.length} bytes, hasStream: ${!!this.currentResponseStream}`);
+
+
+      // Stream Aggregation: Create one stream per turn
+      if (!this.currentResponseStream && this.audioPlayer) {
+        this.currentResponseStream = new PassThrough();
+        const resource = createAudioResource(this.currentResponseStream, {
+          inputType: StreamType.Raw,
+        });
+        this.audioPlayer.play(resource);
+        debugVoice('Started new aggregated response stream');
+      }
+
+      if (this.currentResponseStream && !this.currentResponseStream.destroyed) {
+        writeChunkToPlayback(this.currentResponseStream, {
+          buffer,
+          mimeType: part.inlineData.mimeType,
+        }).catch(err => {
+          console.error('[VoiceSession] Playback write error:', err);
+        });
+        // Do NOT end stream here; wait for turnComplete
+      }
+
+      if (this.sessionEndRequested && this.awaitingGoodbyeResponse) {
+        this.awaitingGoodbyeResponse = false;
+        if (this.goodbyeTimeoutHandle) {
+          clearTimeout(this.goodbyeTimeoutHandle);
+          this.goodbyeTimeoutHandle = null;
+        }
+        this.scheduleDestroyAfterPlayback('Echo ended the call as requested.');
+      }
+    }
+  }
+
+  sendInitialInstructions() {
+    if (this.initialInstructionsSent || !this.liveSession) return;
+    this.initialInstructionsSent = true;
+    try {
+      this.liveSession.sendClientContent({
+        turns: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: `Voice link ready. ${CALL_END_INSTRUCTION} Never speak the summary aloud—only the text response should contain it. End each spoken reply once without repeating the final word. If anyone says "goodbye", "hang up", or "you can leave now", acknowledge them, say you are leaving, and include the token so I can shut down the call.`,
+              },
+            ],
+          },
+        ],
+      });
+    } catch (err) {
+      console.error('[VoiceSession] Failed to seed live session:', err);
+    }
+  }
+
+  handleTextPart(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    debugVoice('Echo (voice) text part:', trimmed);
+    console.log('[VoiceSession] Gemini summary:', {
+      guildId: this.voiceChannel.guild?.id,
+      channelId: this.voiceChannel.id,
+      summary: trimmed,
+    });
+    if (this.sessionEndRequested && this.awaitingGoodbyeResponse) {
+      this.awaitingGoodbyeResponse = false;
+      if (this.goodbyeTimeoutHandle) {
+        clearTimeout(this.goodbyeTimeoutHandle);
+        this.goodbyeTimeoutHandle = null;
+      }
+      this.scheduleDestroyAfterPlayback('Echo ended the call as requested.');
+    }
+    if (textRequestsHangup(trimmed)) {
+      this.handleHangupRequest('gemini-response', trimmed);
+    }
+  }
+
+  handleHangupRequest(source = 'user', transcript = '') {
+    if (this.destroyed) {
+      return;
+    }
+
+    const userInitiated = source === 'user-voice' || source === 'user-text';
+    if (userInitiated) {
+      if (this.sessionEndRequested && this.awaitingGoodbyeResponse) {
+        return;
+      }
+      if (transcript) {
+        debugVoice('User hangup detected', { source, transcript });
+      }
+      if (!this.sessionEndRequested) {
+        this.sessionEndRequested = true;
+      }
+      this.awaitingGoodbyeResponse = true;
+      debugVoice('Goodbye detected. Waiting for Gemini farewell before disconnecting.');
+      this.promptGeminiToWrapUp(transcript);
+      return;
+    }
+
+    if (!this.sessionEndRequested) {
+      this.sessionEndRequested = true;
+    }
+    this.awaitingGoodbyeResponse = false;
+    if (this.goodbyeTimeoutHandle) {
+      clearTimeout(this.goodbyeTimeoutHandle);
+      this.goodbyeTimeoutHandle = null;
+    }
+    if (transcript) {
+      debugVoice('Gemini hangup detected', { source, transcript });
+    }
+    const reason = source === 'gemini-response'
+      ? 'Echo ended the call after saying goodbye.'
+      : 'Voice session ended on request.';
+    this.scheduleDestroyAfterPlayback(reason);
+  }
+
+  promptGeminiToWrapUp(transcript = '') {
+    if (this.destroyed) {
+      return;
+    }
+    if (!this.liveSession) {
+      debugVoice('Cannot request goodbye response — live session missing.');
+      this.awaitingGoodbyeResponse = false;
+      this.scheduleDestroyAfterPlayback('Live session closed before goodbye could be delivered.');
+      return;
+    }
+
+    const contextLine = transcript
+      ? `The user just said: "${transcript}" and asked you to end the call.`
+      : 'A user asked you to end the call.';
+    const instruction = `${contextLine} Respond with one short, friendly goodbye acknowledging the request, then conclude the conversation. Your text summary MUST end with ${CALL_END_TOKEN} or the bot cannot hang up.`;
+
+    try {
+      this.liveSession.sendClientContent({
+        turns: [
+          {
+            role: 'user',
+            parts: [{ text: instruction }],
+          },
+        ],
+      });
+    } catch (error) {
+      console.error('[VoiceSession] Failed to prompt Gemini for goodbye response:', error);
+      this.awaitingGoodbyeResponse = false;
+      this.scheduleDestroyAfterPlayback('Failed to prompt Gemini for goodbye.');
+      return;
+    }
+
+    if (this.goodbyeTimeoutHandle) {
+      clearTimeout(this.goodbyeTimeoutHandle);
+    }
+    this.goodbyeTimeoutHandle = setTimeout(() => {
+      this.goodbyeTimeoutHandle = null;
+      if (this.destroyed || !this.sessionEndRequested || !this.awaitingGoodbyeResponse) {
+        return;
+      }
+      debugVoice('Goodbye response timeout elapsed, ending session.');
+      this.awaitingGoodbyeResponse = false;
+      this.scheduleDestroyAfterPlayback('Timed out waiting for Gemini goodbye response.');
+    }, 10_000);
+  }
+
+  scheduleDestroyAfterPlayback(reason = 'Session ended.') {
+    if (this.destroyed) return;
+
+    this.pendingDestroyReason = reason || this.pendingDestroyReason || 'Session ended.';
+    if (this.destroyAfterPlaybackHandle) {
+      return;
+    }
+
+    const pollPlayback = () => {
+      if (this.destroyed) {
+        this.destroyAfterPlaybackHandle = null;
+        return;
+      }
+
+      this.destroyAfterPlaybackHandle = null;
+
+      const playerState = this.audioPlayer?.state;
+      const playerIdle = !playerState || playerState.status === AudioPlayerStatus.Idle;
+
+      if (playerIdle) {
+        const finalReason = this.pendingDestroyReason || reason;
+        this.pendingDestroyReason = null;
+        void this.destroy(finalReason);
+        return;
+      }
+
+      this.destroyAfterPlaybackHandle = setTimeout(pollPlayback, 250);
+    };
+
+    pollPlayback();
+  }
+
+  flushPlayback(reason) {
+    if (reason) {
+      console.warn('[VoiceSession] Flushing playback:', reason);
+    }
+    try {
+      if (this.audioPlayer) {
+        this.audioPlayer.stop(true);
+      }
+    } catch (e) {
+      console.error('[VoiceSession] Failed to stop player during flush:', e);
+    }
+  }
+
+  async destroy(reason) {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.sessionEndRequested = true;
+    this.awaitingGoodbyeResponse = false;
+    this.pendingDestroyReason = null;
+    if (this.destroyAfterPlaybackHandle) {
+      clearTimeout(this.destroyAfterPlaybackHandle);
+      this.destroyAfterPlaybackHandle = null;
+    }
+    if (this.goodbyeTimeoutHandle) {
+      clearTimeout(this.goodbyeTimeoutHandle);
+      this.goodbyeTimeoutHandle = null;
+    }
+    sessions.delete(this.voiceChannel.id);
+
+    this.clearIdleTimer();
+    for (const [userId] of this.receiverStreams) {
+      this.stopUserStream(userId);
+    }
+
+    try {
+      if (this.audioPlayer) {
+        this.audioPlayer.stop(true);
+      }
+    } catch (error) {
+      console.error('[VoiceSession] Failed to stop audio player:', error);
+    }
+
+    try {
+      if (this.connection) {
+        this.connection.destroy();
+      }
+    } catch (error) {
+      console.error('[VoiceSession] Failed to destroy voice connection:', error);
+    }
+
+    try {
+      if (this.liveSession) {
+        this.liveSession.close();
+      }
+    } catch (error) {
+      console.error('[VoiceSession] Failed to close Gemini session:', error);
+    }
+
+    if (this.audioEndTimer) {
+      clearTimeout(this.audioEndTimer);
+      this.audioEndTimer = null;
+    }
+  }
+
+  resetIdleTimer(context = 'default') {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+    }
+    this.idleTimer = setTimeout(() => {
+      console.warn('[VoiceSession] Idle timeout reached, ending session');
+
+      // Notify the voice channel text chat (if available) before leaving
+      if (this.voiceChannel && this.voiceChannel.send) {
+        this.voiceChannel.send('⏳ Left voice channel due to inactivity (1 minute of silence).')
+          .catch(err => console.error('[VoiceSession] Failed to send timeout message:', err));
+      }
+
+      void this.destroy('Idle timeout (60s silence).');
+    }, IDLE_TIMEOUT_MS);
+    debugVoice('Idle timer reset', { context, timeoutMs: IDLE_TIMEOUT_MS });
+  }
+
+  clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+
+}
+
+function cleanupUserStream(payload) {
+  if (!payload) return;
+
+  const closeStream = (stream, label) => {
+    if (!stream) return;
+    try {
+      if (typeof stream.removeAllListeners === 'function') {
+        stream.removeAllListeners();
+      }
+      if (typeof stream.unpipe === 'function') {
+        stream.unpipe();
+      }
+      if (typeof stream.destroy === 'function' && !stream.destroyed) {
+        stream.destroy();
+      }
+    } catch (error) {
+      debugVoice(`Failed to cleanup ${label}`, error);
+    }
+  };
+
+  closeStream(payload.opusStream, 'opusStream');
+  closeStream(payload.decoder, 'decoder');
+
+  payload.opusStream = null;
+  payload.decoder = null;
+  payload.transcriptionBuffers = [];
+  payload.transcriptionByteLength = 0;
+}
+
+function buildFfmpegArgs(mimeType = '') {
+  const lower = mimeType.toLowerCase();
+  const args = ['-analyzeduration', '0', '-loglevel', '0'];
+
+  if (lower.startsWith('audio/pcm')) {
+    const rate = extractNumber(lower, 'rate') || 24000;
+    const channels = extractNumber(lower, 'channels') || 1;
+    args.push('-f', 's16le', '-ar', `${rate}`, '-ac', `${channels}`);
+  } else if (lower.startsWith('audio/wav')) {
+    args.push('-f', 'wav');
+  } else if (lower.startsWith('audio/mp3')) {
+    args.push('-f', 'mp3');
+  } else if (lower.startsWith('audio/ogg')) {
+    args.push('-f', 'ogg');
+  }
+
+  args.push('-i', 'pipe:0', '-ac', '2', '-ar', '48000', '-f', 's16le', 'pipe:1');
+  return args;
+}
+
+function createAudioResourceFromChunk({ buffer, mimeType }) {
+  if (!buffer || buffer.length === 0) return null;
+
+  const lower = (mimeType || '').toLowerCase();
+  if (lower.startsWith('audio/pcm')) {
+    const sampleRate = extractNumber(lower, 'rate') || 24000;
+    const channels = extractNumber(lower, 'channels') || 1;
+    const pcmBuffer = ensurePcm48kStereo(buffer, sampleRate, channels);
+    return createAudioResource(Readable.from([pcmBuffer]), { inputType: StreamType.Raw });
+  }
+
+  const args = buildFfmpegArgs(mimeType);
+  const transcoder = new prism.FFmpeg({ args });
+  debugVoice('Creating audio resource via FFmpeg', { mimeType, inputBytes: buffer.length, args });
+  transcoder.on('error', (error) => {
+    console.error('[VoiceSession] FFmpeg error:', error);
+  });
+  const stream = Readable.from([buffer]);
+  stream.on('error', (error) => {
+    console.error('[VoiceSession] Buffer stream error:', error);
+  });
+  stream.pipe(transcoder);
+  return createAudioResource(transcoder, { inputType: StreamType.Raw });
+}
+
+const HANGUP_REGEXES = [
+  /\bgood\s*bye\b/i,
+  /\bbye\b/i,
+  /\bsee (?:ya|you)\b/i,
+  /\bhang\s*up\b/i,
+  /\bdisconnect\b/i,
+  /\bend (?:the )?(?:call|conversation|session)\b/i,
+  /\bstop listening\b/i,
+  /\bstop talking\b/i,
+  /\byou (?:can|may) (?:leave|go)\b/i,
+  /\bplease leave\b/i,
+  /\bgo away\b/i,
+];
+
+function textRequestsHangup(text) {
+  if (!text) return false;
+  const normalized = text.toLowerCase();
+  if (normalized.includes(CALL_END_TOKEN.toLowerCase())) {
+    return true;
+  }
+  if (HANGUP_REGEXES.some((regex) => regex.test(normalized))) {
+    return true;
+  }
+  if (normalized.includes('leave')) {
+    const leaveContextRegex = /(echo|you|please|now|channel|call|voice|conversation)/i;
+    if (leaveContextRegex.test(normalized)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractNumber(source, key) {
+  const match = source.match(new RegExp(`${key}=(\d+)`));
+  if (!match) return null;
+  return Number(match[1]);
+}
+
+function buildWavBufferFromPcm({ pcmBuffer, sampleRate, channels }) {
+  const bytesPerSample = 2;
+  const blockAlign = channels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = pcmBuffer.length;
+  const totalSize = 44 + dataSize;
+  const wavBuffer = Buffer.alloc(totalSize);
+
+  wavBuffer.write('RIFF', 0);
+  wavBuffer.writeUInt32LE(totalSize - 8, 4);
+  wavBuffer.write('WAVE', 8);
+  wavBuffer.write('fmt ', 12);
+  wavBuffer.writeUInt32LE(16, 16);
+  wavBuffer.writeUInt16LE(1, 20);
+  wavBuffer.writeUInt16LE(channels, 22);
+  wavBuffer.writeUInt32LE(sampleRate, 24);
+  wavBuffer.writeUInt32LE(byteRate, 28);
+  wavBuffer.writeUInt16LE(blockAlign, 32);
+  wavBuffer.writeUInt16LE(bytesPerSample * 8, 34);
+  wavBuffer.write('data', 36);
+  wavBuffer.writeUInt32LE(dataSize, 40);
+  pcmBuffer.copy(wavBuffer, 44);
+  return wavBuffer;
+}
+
+function ensurePcm48kStereo(buffer, sampleRate, channels) {
+  let working = buffer;
+  if (channels !== 1) {
+    working = downmixToMono(working, channels);
+  }
+
+  if (sampleRate !== 48000) {
+    working = resampleMonoPcm(working, sampleRate, 48000);
+  }
+
+  return duplicateMonoToStereo(working);
+}
+
+function downmixToMono(buffer, channels) {
+  if (channels <= 1) return buffer;
+  const sampleCount = buffer.length / 2 / channels;
+  const mono = Buffer.alloc(sampleCount * 2);
+  for (let i = 0; i < sampleCount; i++) {
+    let sum = 0;
+    for (let ch = 0; ch < channels; ch++) {
+      const offset = (i * channels + ch) * 2;
+      sum += buffer.readInt16LE(offset);
+    }
+    const avg = Math.round(sum / channels);
+    mono.writeInt16LE(avg, i * 2);
+  }
+  return mono;
+}
+
+function resampleMonoPcm(buffer, fromRate, toRate) {
+  if (fromRate === toRate || fromRate <= 0) {
+    return Buffer.from(buffer);
+  }
+
+  const ratio = toRate / fromRate;
+  const inputSamples = buffer.length / 2;
+  const outputSamples = Math.max(1, Math.round(inputSamples * ratio));
+  const output = Buffer.alloc(outputSamples * 2);
+
+  for (let i = 0; i < outputSamples; i++) {
+    const origin = i / ratio;
+    const leftIndex = Math.floor(origin);
+    const rightIndex = Math.min(leftIndex + 1, inputSamples - 1);
+    const interp = origin - leftIndex;
+    const leftSample = buffer.readInt16LE(leftIndex * 2);
+    const rightSample = buffer.readInt16LE(rightIndex * 2);
+    const value = Math.round(leftSample * (1 - interp) + rightSample * interp);
+    output.writeInt16LE(value, i * 2);
+  }
+
+  return output;
+}
+
+function duplicateMonoToStereo(buffer) {
+  const sampleCount = buffer.length / 2;
+  const stereo = Buffer.alloc(sampleCount * 4);
+  for (let i = 0; i < sampleCount; i++) {
+    const value = buffer.readInt16LE(i * 2);
+    const offset = i * 4;
+    stereo.writeInt16LE(value, offset);
+    stereo.writeInt16LE(value, offset + 2);
+  }
+  return stereo;
+}
+
+
+
+
+
+async function writeChunkToPlayback(playbackStream, chunk) {
+  const lower = (chunk.mimeType || '').toLowerCase();
+  if (lower.startsWith('audio/pcm')) {
+    const sampleRate = extractNumber(lower, 'rate') || 24000;
+    const channels = extractNumber(lower, 'channels') || 1;
+    const pcmBuffer = ensurePcm48kStereo(chunk.buffer, sampleRate, channels);
+    playbackStream.write(pcmBuffer);
+    return;
+  }
+
+  await transcodeChunkToStream(chunk, playbackStream);
+}
+
+function transcodeChunkToStream(chunk, destinationStream) {
+  if (!destinationStream || destinationStream.destroyed) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const args = buildFfmpegArgs(chunk.mimeType);
+    const transcoder = new prism.FFmpeg({ args });
+    const input = Readable.from([chunk.buffer]);
+
+    const cleanup = (error) => {
+      transcoder.removeAllListeners();
+      input.removeAllListeners();
+      try {
+        transcoder.unpipe(destinationStream);
+      } catch (unpipeError) {
+        debugVoice('Failed to unpipe transcoder', unpipeError);
+      }
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+
+    transcoder.once('error', cleanup);
+    transcoder.once('close', () => cleanup());
+    input.once('error', cleanup);
+
+    transcoder.pipe(destinationStream, { end: false });
+    input.pipe(transcoder);
+  });
+}
+
+function extractTextFromGenerateResponse(response) {
+  if (!response) {
+    return '';
+  }
+  if (typeof response.text === 'string' && response.text.trim()) {
+    return response.text;
+  }
+  const candidates = response.candidates;
+  if (Array.isArray(candidates)) {
+    for (const candidate of candidates) {
+      const parts = candidate?.content?.parts;
+      if (!Array.isArray(parts)) continue;
+      const text = parts
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .join(' ')
+        .trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+  return '';
+}
+
+function describeCloseEvent(event) {
+  if (!event) return '';
+  const parts = [];
+  if (typeof event.code === 'number') {
+    parts.push(`code ${event.code}`);
+  }
+  if (event.reason) {
+    parts.push(`reason "${event.reason}"`);
+  }
+  return parts.join(', ');
+}
+
+async function startVoiceSession({ voiceChannel, initiatedBy, voiceName }) {
+  if (sessions.has(voiceChannel.id)) {
+    throw new Error('Echo is already active in this voice channel.');
+  }
+
+  const session = new VoiceSession({ voiceChannel, initiatedBy, voiceName });
+  try {
+    await session.start();
+    sessions.set(voiceChannel.id, session);
+    return session;
+  } catch (error) {
+    await session.destroy('Setup failed.');
+    throw error;
+  }
+}
+
+async function endVoiceSession(channelId, reason = 'Session ended.') {
+  const session = sessions.get(channelId);
+  if (!session) return false;
+  await session.destroy(reason);
+  return true;
+}
+
+function isSessionActive(channelId) {
+  return sessions.has(channelId);
+}
+
+module.exports = {
+  startVoiceSession,
+  endVoiceSession,
+  isSessionActive,
+  createAudioResourceFromChunk,
+};
