@@ -5,6 +5,7 @@
 const { pool } = require('../db');
 const { debugLog } = require('../utils/debugging');
 const { triggerCheck } = require('./scheduler');
+const { getGuildSettings } = require('./guild-settings');
 
 /**
  * Main entry point: observe NEW message
@@ -18,6 +19,11 @@ async function observe(message) {
 
     // Ignore DMs for now, we only track server activity for privacy and prevent schema mismatches
     if (!message.guild) return;
+
+    const settings = await getGuildSettings(message.guild.id);
+
+    // Passive logging off: skip storing and skip nudging the scheduler
+    if (!settings.passiveLogging) return;
 
     // Prevents empty rows for embeds/stickers/system messages
     if (!message.content || message.content.trim() === '') {
@@ -53,8 +59,10 @@ async function observe(message) {
         debugLog(`[Observer] Saved message from ${message.author.username} in ${Date.now() - start}ms`);
 
         // Trigger immediate analysis check (real-time responsiveness)
-        // This is fire-and-forget, ensuring message processing isn't blocked by analysis
-        triggerCheck(message.guild.id);
+        // Only do this when background analysis is enabled
+        if (settings.backgroundAnalysis) {
+            triggerCheck(message.guild.id);
+        }
 
 
 

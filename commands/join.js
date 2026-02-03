@@ -6,11 +6,13 @@ const { SlashCommandBuilder, ChannelType, PermissionFlagsBits, MessageFlags } = 
 const { startVoiceSession, getVoiceSession } = require('../voiceSessionManager');
 const { GEMINI_AVAILABLE_VOICES } = require('../config');
 
-// Build voice choices from config array
-const VOICE_CHOICES = (GEMINI_AVAILABLE_VOICES || []).map(({ value, description }) => ({
-  name: description ? `${value} (${description})` : value,
-  value,
-}));
+// Helper function to build voice choices dynamically
+const getVoiceChoices = () => {
+  return (GEMINI_AVAILABLE_VOICES || []).map(({ value, description }) => ({
+    name: description ? `${value} (${description})` : value,
+    value,
+  }));
+};
 
 /* COMMAND DEFINITION */
 module.exports = {
@@ -23,8 +25,8 @@ module.exports = {
         .setDescription('Optional: choose a beta voice preset')
         .setRequired(false);
 
-      // Add all available voice choices from config
-      for (const choice of VOICE_CHOICES) {
+      // Add all available voice choices from config (built dynamically each deploy)
+      for (const choice of getVoiceChoices()) {
         option.addChoices(choice);
       }
       return option;

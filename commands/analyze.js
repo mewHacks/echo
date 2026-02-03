@@ -35,7 +35,7 @@ module.exports = {
             const guildId = interaction.guild.id;
 
             // Call the core engine
-            const result = await analyzeGuild(guildId);
+            const result = await analyzeGuild(guildId, { force: true });
 
             // Analyzer returns null when there are no new messages
             if (!result) {

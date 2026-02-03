@@ -110,9 +110,8 @@ async function executeSearchChannelHistory(guildId, args) {
         if (channelId === 'all') {
             // Server-wide search
             sql = `
-                SELECT m.content, m.author_name, m.created_at, c.name as channel_name
+                SELECT m.content, m.username, m.created_at, m.channel_name
                 FROM messages m
-                JOIN channels c ON m.channel_id = c.channel_id
                 WHERE m.guild_id = ? 
                   AND m.created_at > NOW() - ${timeFilter}
                   AND m.content LIKE ?
@@ -123,7 +122,7 @@ async function executeSearchChannelHistory(guildId, args) {
         } else {
             // Channel-specific search
             sql = `
-                SELECT m.content, m.author_name, m.created_at
+                SELECT m.content, m.username, m.created_at
                 FROM messages m
                 WHERE m.guild_id = ? 
                   AND m.channel_id = ?
@@ -147,7 +146,7 @@ async function executeSearchChannelHistory(guildId, args) {
 
         // Format results for AI consumption
         const results = rows.map((/** @type {any} */ r) => ({
-            author: r.author_name,
+            author: r.username,
             content: r.content.substring(0, 200), // Truncate for token efficiency
             channel: r.channel_name || 'this channel',
             time: r.created_at
@@ -172,45 +171,88 @@ async function executeSearchChannelHistory(guildId, args) {
  * @param {any} args - Function arguments from Gemini
  * @returns {Promise<Object>} - Channel summaries
  */
+const { getGeminiClient } = require('../gemini-client');
+const { getChannelMemory, updateChannelSummary } = require('../memoryStore');
+const { GEMINI_TEXT_MODEL } = require('../config/models');
+
+/**
+ * Get summaries for specified channels
+ * Generates them on-demand if missing
+ * 
+ * @param {string} guildId - Discord guild ID
+ * @param {any} args - Function arguments from Gemini
+ * @returns {Promise<Object>} - Channel summaries
+ */
 async function executeGetChannelSummary(guildId, args) {
     const { channelIds } = args;
 
     debugLog(`[MemoryTools] Getting summaries for ${channelIds.length} channels`);
 
-    const conn = await pool.getConnection();
-    try {
-        const placeholders = channelIds.map(() => '?').join(',');
-        /** @type {any[]} */
-        const [rows] = await conn.query(`
-            SELECT channel_id, name, summary, updated_at
-            FROM channels
-            WHERE guild_id = ? AND channel_id IN (${placeholders})
-        `, [guildId, ...channelIds]);
+    const summaries = [];
 
-        if (rows.length === 0) {
-            return {
-                found: false,
-                message: 'No summaries available for the specified channels.'
-            };
+    for (const channelId of channelIds) {
+        // Fetch existing summary and recent messages from memoryStore
+        const { summary, messages } = await getChannelMemory(channelId, 50);
+
+        // Logic: If summary exists and is fresh (checked via updated_at in DB, but memoryStore logic simplifies to just string)
+        // For now, if summary is empty or very short, regenerate it.
+        if (summary && summary.length > 10) {
+            summaries.push({
+                id: channelId,
+                summary,
+                generated: false
+            });
+            continue;
         }
 
-        // Group summaries
-        const summaries = rows.map((/** @type {any} */ r) => ({
-            id: r.channel_id,
-            name: r.name,
-            summary: r.summary || 'No summary available yet.',
-            lastUpdated: r.updated_at
-        }));
+        // If no summary, generate one from recent messages
+        if (messages.length === 0) {
+            summaries.push({
+                id: channelId,
+                summary: 'No recent activity to summarize.',
+                generated: false
+            });
+            continue;
+        }
 
-        return {
-            found: true,
-            count: summaries.length,
-            summaries
-        };
+        // Generate with Gemini
+        try {
+            const transcript = messages.map((/** @type {any} */ m) => `${m.role === 'user' ? 'User' : 'Echo'} (${m.userId || 'bot'}): ${m.content}`).join('\n');
+            const prompt = `Summarize the following chat conversation from #${channelId} in 2-3 sentences. Focus on key topics and decisions. \n\n${transcript}`;
 
-    } finally {
-        conn.release();
+            const ai = getGeminiClient();
+            const result = await ai.models.generateContent({
+                model: GEMINI_TEXT_MODEL, // Fast model for summaries
+                contents: [{ role: 'user', parts: [{ text: prompt }] }]
+            });
+
+            const newSummary = result.response.text().trim();
+
+            // Save it for future use
+            await updateChannelSummary(channelId, newSummary);
+            debugLog(`[MemoryTools] Generated new summary for ${channelId}`);
+
+            summaries.push({
+                id: channelId,
+                summary: newSummary,
+                generated: true
+            });
+
+        } catch (err) {
+            console.error(`[MemoryTools] Failed to generate summary for ${channelId}:`, err);
+            summaries.push({
+                id: channelId,
+                summary: 'Error generating summary.',
+                error: true
+            });
+        }
     }
+
+    return {
+        found: true,
+        count: summaries.length,
+        summaries
+    };
 }
 
 /**

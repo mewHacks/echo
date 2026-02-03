@@ -172,6 +172,7 @@ describe('Intervention Planner Module', () => {
     beforeEach(() => {
         resetAllMocks();
         jest.clearAllMocks();
+        jest.restoreAllMocks();
         clearCooldown('guild-123');
     });
 
@@ -300,10 +301,17 @@ describe('Intervention Planner Module', () => {
 
             const state = createMockState({ moodScore: 0, moodTrend: 'stable' });
 
+            const now = 1000000000;
+            jest.spyOn(Date, 'now').mockReturnValue(now);
+
             // First trigger with RELAXED tier
             await triggerIntervention('guild-123', ['mood_positive'], state);
 
-            // Second trigger with URGENT tier should bypass (0ms cooldown)
+            // Advance time by 31s to pass URGENT debounce (30s)
+            // But still within RELAXED cooldown (15m)
+            jest.spyOn(Date, 'now').mockReturnValue(now + 31000);
+
+            // Second trigger with URGENT tier should bypass RELAXED cooldown
             const result2 = await triggerIntervention('guild-123', ['HELP_REQUEST'], state);
             expect(result2).not.toBeNull();
         });
@@ -589,9 +597,15 @@ describe('Intervention Planner Module', () => {
 
             const state = createMockState({ moodScore: -0.8, moodTrend: 'falling' });
 
+            const now = 1000000000;
+            jest.spyOn(Date, 'now').mockReturnValue(now);
+
             // Trigger with mixed tiers
             const result = await triggerIntervention('guild-123', ['HELP_REQUEST', 'mood_negative'], state);
             expect(result).not.toBeNull();
+
+            // Advance time by 31s
+            jest.spyOn(Date, 'now').mockReturnValue(now + 31000);
 
             // Immediately trigger again with URGENT
             const result2 = await triggerIntervention('guild-123', ['HELP_REQUEST'], state);
@@ -808,6 +822,46 @@ describe('DM_MODERATOR Action', () => {
 
         expect(result.action).toBe('DM_MODERATOR');
         expect(result.executed).toBe(true);
+    });
+
+    it('should include username in DM if available in events', async () => {
+        const mockMod = {
+            id: 'mod-1',
+            user: { id: 'mod-1', tag: 'Moderator#0001', bot: false },
+            permissions: { has: () => true },
+            send: jest.fn().mockResolvedValue({ id: 'dm-msg-id' }),
+        };
+
+        const modCache = new Map([['mod-1', mockMod]]);
+        const mockGuild = {
+            id: 'guild-123',
+            name: 'Test Server',
+            channels: { cache: { get: () => null } },
+            members: {
+                me: { id: 'bot-id' },
+                cache: { filter: () => modCache },
+                fetch: jest.fn().mockResolvedValue(modCache),
+            },
+        };
+        addMockGuild(mockGuild);
+        mockClientReady = true;
+
+        setMockGeminiResponse({
+            action: 'DM_MODERATOR',
+            content: 'User needs help',
+            reasoning: 'Safety',
+            confidence: 0.9
+        });
+
+        const state = createMockState({
+            moodScore: -0.9,
+            recentEvents: [{ type: 'HELP_REQUEST', desc: 'Help me', confidence: 1.0, user: 'TroubledUser' }]
+        });
+
+        const result = await triggerIntervention('guild-123', ['HELP_REQUEST'], state);
+
+        expect(result.executed).toBe(true);
+        expect(mockMod.send).toHaveBeenCalledWith(expect.stringContaining('Related User:** TroubledUser'));
     });
 
     it('should NOT execute DM_MODERATOR when confidence < 0.7', async () => {

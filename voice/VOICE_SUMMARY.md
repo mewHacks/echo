@@ -25,12 +25,20 @@ Enable real-time voice conversations between Discord users and Gemini Live API, 
 
 ### Architecture Layers
 
+### Privacy by Design: Ephemeral Streaming
+**Crucial for User Trust:**
+Echo treats voice data as **ephemeral**.
+1.  **Stream:** Audio is streamed in real-time chunks to Gemini.
+2.  **Process:** It is converted to semantic vectors instantly.
+3.  **Discard:** The raw audio buffer is overwritten/discarded immediately.
+**WE DO NOT STORE AUDIO FILES.** This architecture ensures we can offer safety features without becoming a surveillance tool.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        USER LAYER                           │
 │                   (Discord Voice Channel)                   │
 └─────────────────────────────────────────────────────────────┘
-                              ↓ Opus audio
+                              ↓ Opus audio (Ephemeral)
 ┌─────────────────────────────────────────────────────────────┐
 │                     COMMAND LAYER                           │
 │                    commands/join.js                         │
@@ -660,5 +668,5 @@ The voice system is a well-architected, modular design that successfully bridges
 2. Gather user feedback on voice quality
 3. Evaluate VAD integration (high impact)
 
-Last updated: 2026-01-20
+Last updated: 2026-01-16
 

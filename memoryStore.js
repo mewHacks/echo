@@ -1,8 +1,12 @@
 // memoryStore.js
 const { pool } = require('./db');
 
+/** @typedef {import('mysql2/promise').RowDataPacket} RowDataPacket */
+/** @typedef {import('mysql2/promise').ResultSetHeader} ResultSetHeader */
+
 /**
  * Ensure a channel row exists.
+ * @param {string} channelId
  */
 async function ensureChannel(channelId) {
   await pool.execute(
@@ -15,10 +19,9 @@ async function ensureChannel(channelId) {
 
 /**
  * Append a message to memory (user or assistant)
- * role: 'user' | 'assistant'
- * userId: Discord user ID or null for bot
- * content: string
- * timestamp: ISO string or Date (optional, defaults to now)
+ * @param {string} channelId
+ * @param {{ role: 'user' | 'assistant', userId?: string | null, content: string, timestamp?: string | Date }} messageData
+ * @param {string} [guildId]
  */
 async function addMessage(channelId, { role, userId, content, timestamp }, guildId) {
   await ensureChannel(channelId);
@@ -36,6 +39,9 @@ async function addMessage(channelId, { role, userId, content, timestamp }, guild
  * Get stored memory for a channel:
  * - summary (from channels.summary)
  * - last N messages (ordered oldest → newest)
+ * @param {string} channelId
+ * @param {number} [limit=50]
+ * @returns {Promise<{ summary: string, messages: Array<any> }>}
  */
 async function getChannelMemory(channelId, limit = 50) {
   await ensureChannel(channelId);
@@ -47,7 +53,9 @@ async function getChannelMemory(channelId, limit = 50) {
     [channelId]
   );
 
-  const summary = channelRows[0]?.summary || '';
+  // Cast to RowDataPacket[] to fix TS errors 
+  const rows = /** @type {RowDataPacket[]} */ (channelRows);
+  const summary = rows[0]?.summary || '';
 
   const [messageRows] = await pool.execute(
     `SELECT role,
@@ -61,14 +69,16 @@ async function getChannelMemory(channelId, limit = 50) {
     [channelId, limit]
   );
 
-  // Reverse so oldest → newest
-  const messages = messageRows.reverse();
+  // Cast and reverse
+  const msgs = /** @type {RowDataPacket[]} */ (messageRows);
+  const messages = msgs.reverse();
 
   return { summary, messages };
 }
 
 /**
  * Ensure a guild row exists.
+ * @param {string} guildId
  */
 async function ensureGuild(guildId) {
   await pool.execute(
@@ -83,6 +93,8 @@ async function ensureGuild(guildId) {
  * Get stored memory for a guild:
  * - summary
  * - users (JSON string)
+ * @param {string} guildId
+ * @returns {Promise<{ summary: string, users: string }>}
  */
 async function getGuildMemory(guildId) {
   await ensureGuild(guildId);
@@ -94,12 +106,16 @@ async function getGuildMemory(guildId) {
     [guildId]
   );
 
-  const row = rows[0] || {};
+  const r = /** @type {RowDataPacket[]} */ (rows);
+  const row = r[0] || {};
   return { summary: row.summary || '', users: row.users || '[]' };
 }
 
 /**
  * Update or set the summary and users JSON for a guild.
+ * @param {string} guildId
+ * @param {string} summary
+ * @param {string} usersJson
  */
 async function updateGuildMemory(guildId, summary, usersJson) {
   await ensureGuild(guildId);
@@ -117,9 +133,13 @@ async function updateGuildMemory(guildId, summary, usersJson) {
 /**
  * Set a note for a user in the guild's users JSON.
  * Creates or updates a user entry with a `note` field.
+ * @param {string} guildId
+ * @param {string} userId
+ * @param {string} note
  */
 async function setUserNote(guildId, userId, note) {
   const guild = await getGuildMemory(guildId);
+  /** @type {Array<{id: string, note?: string}>} */
   const users = JSON.parse(guild.users || '[]');
 
   let user = users.find(u => String(u.id) === String(userId));
@@ -135,9 +155,13 @@ async function setUserNote(guildId, userId, note) {
 
 /**
  * Get the note for a user in a guild, or null if none.
+ * @param {string} guildId
+ * @param {string} userId
+ * @returns {Promise<string|null>}
  */
 async function getUserNote(guildId, userId) {
   const guild = await getGuildMemory(guildId);
+  /** @type {Array<{id: string, note?: string}>} */
   const users = JSON.parse(guild.users || '[]');
 
   const user = users.find(u => String(u.id) === String(userId));
@@ -146,6 +170,8 @@ async function getUserNote(guildId, userId) {
 
 /**
  * Update or set the summary for a channel.
+ * @param {string} channelId
+ * @param {string} summary
  */
 async function updateChannelSummary(channelId, summary) {
   await ensureChannel(channelId);
@@ -161,6 +187,8 @@ async function updateChannelSummary(channelId, summary) {
 
 /**
  * Keep only the latest N messages in a channel, delete older ones.
+ * @param {string} channelId
+ * @param {number} [keepLatest=50]
  */
 async function truncateOldMessages(channelId, keepLatest = 50) {
   // MySQL: delete any rows not in the set of latest `keepLatest` ids
@@ -185,8 +213,8 @@ async function truncateOldMessages(channelId, keepLatest = 50) {
  * Returns summaries from top N active channels + trending topics
  * 
  * @param {string} guildId - Discord guild ID
- * @param {Object} options - Configuration options
- * @returns {Object} - { summaries, topics, contextString }
+ * @param {{ maxChannels?: number, timeWindowHours?: number }} [options] - Configuration options
+ * @returns {Promise<{ summaries: Array<any>, topics: Array<string>, contextString: string }>} - { summaries, topics, contextString }
  */
 async function getGuildWideContext(guildId, options = {}) {
   const { maxChannels = 5, timeWindowHours = 24 } = options;
@@ -209,7 +237,10 @@ async function getGuildWideContext(guildId, options = {}) {
       LIMIT ?
     `, [guildId, timeWindowHours, maxChannels]);
 
-    if (activeChannels.length === 0) {
+    // Cast result to RowDataPacket[]
+    const channels = /** @type {RowDataPacket[]} */ (activeChannels);
+
+    if (channels.length === 0) {
       return {
         summaries: [],
         topics: [],
@@ -218,7 +249,7 @@ async function getGuildWideContext(guildId, options = {}) {
     }
 
     // Build summaries array
-    const summaries = activeChannels.map(ch => ({
+    const summaries = channels.map(ch => ({
       channelId: ch.channel_id,
       name: ch.name || 'unknown',
       summary: ch.summary || 'No summary yet',
@@ -234,7 +265,8 @@ async function getGuildWideContext(guildId, options = {}) {
       LIMIT 5
     `, [guildId]);
 
-    const topics = topicsRows.map(t => t.topic);
+    const tRows = /** @type {RowDataPacket[]} */ (topicsRows);
+    const topics = tRows.map(t => t.topic);
 
     // Build context string for AI consumption
     const channelSummaries = summaries

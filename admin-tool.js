@@ -18,7 +18,21 @@ Object.entries(actionsConfig).forEach(([name, config]) => {
 });
 
 const searchTool = [
-  { googleSearch: {} },
+  {
+    functionDeclarations: [
+      {
+        name: 'web_search',
+        description: 'Search the internet for current, real-time information. Use this for: current prices, news, weather, sports scores, recent events, trending topics, or any information that changes over time. Returns the latest data from the web.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Search query for current information' }
+          },
+          required: ['query']
+        }
+      }
+    ]
+  }
 ];
 
 const adminTools = [

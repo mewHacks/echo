@@ -1,9 +1,9 @@
 -- Idempotent schema for Echo bot
 -- This file is safe to re-run: it creates the database and tables if missing
 
-CREATE DATABASE IF NOT EXISTS `echo` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS `mee7` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-USE `echo`;
+USE `mee7`;
 
 -- Channels table for storing channel summaries
 CREATE TABLE IF NOT EXISTS channels (
@@ -121,15 +121,33 @@ CREATE TABLE IF NOT EXISTS server_state (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
+-- Guild-level feature toggles for analysis and notifications
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id VARCHAR(32) PRIMARY KEY,
+    passive_logging TINYINT(1) DEFAULT 1, -- Track and store messages for analysis
+    background_analysis TINYINT(1) DEFAULT 1, -- Allow scheduler-driven analysis jobs
+    admin_dm TINYINT(1) DEFAULT 0, -- Allow DM alerts to admins/moderators
+    channel_message TINYINT(1) DEFAULT 0, -- Allow public intervention posts
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
 -- Intervention history table for tracking automated interventions
 -- Records all decisions made by intervention-planner.js
 CREATE TABLE IF NOT EXISTS intervention_history (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     guild_id VARCHAR(32) NOT NULL,
-    trigger_type VARCHAR(50), -- e.g., 'mood_negative', 'voice_activity'
+    trigger_type VARCHAR(255), -- e.g., 'mood_negative', 'voice_activity'
     action_taken VARCHAR(50), -- e.g., 'POST_SUMMARY', 'DO_NOTHING'
     reasoning TEXT, -- Gemini's explanation for the decision
     confidence FLOAT, -- Gemini's confidence in the decision (0.0 to 1.0)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_intervention_guild (guild_id, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
+
+-- ALTER TABLE server_state
+-- ADD COLUMN context_markers JSON AFTER open_commitments;
+
+-- ALTER TABLE messages
+-- ADD COLUMN event_type ENUM('create', 'edit', 'delete') NOT NULL DEFAULT 'create',
+-- ADD COLUMN previous_content TEXT NULL,
+-- ADD INDEX idx_event_type (event_type);

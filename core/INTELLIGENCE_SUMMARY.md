@@ -77,30 +77,38 @@ Invisible "sticky notes" that provide long-term context (30 min TTL):
 ### Smart Triggers
 The system continuously checks `checkTriggers()` against the Server State.
 
-| Trigger | Threshold | Priority |
-|---------|-----------|----------|
-| `HELP_REQUEST` | Explicit "help", "stalking" | **URGENT** (Tier 1) |
-| `CONFLICT` | LLM Confidence ≥ 0.7 | **STANDARD** (Tier 2) |
-| `mood_negative` | Mood Score < -0.5 | **RELAXED** (Tier 3) |
-| `voice_activity` | Active Voice Session | **STANDARD** (Tier 2) |
+| Trigger | Threshold | Priority | Source |
+|---------|-----------|----------|--------|
+| `SAFETY_RISK` | **Regex Match** (keyword + context) | **CRITICAL** (Tier 0) | `analyzer.js` |
+| `HELP_REQUEST` | Explicit "help" | **URGENT** (Tier 1) | `analyzer.js` |
+| `CONFLICT` | LLM Confidence ≥ 0.7 | **STANDARD** (Tier 2) | `gemini-orchestrator.js` |
+| `mood_negative` | Mood Score < -0.5 | **RELAXED** (Tier 3) | `server-state.js` |
+| `voice_activity` | Active Voice Session | **STANDARD** (Tier 2) | `voiceSessionManager.js` |
 
 ### Smart Cooldowns
 Prevents the bot from becoming spammy or annoying.
 
-1. **URGENT (0 min)**: Immediate action for safety/help requests.
-2. **STANDARD (5 min)**: Normal cooldown for conflicts/events.
-3. **RELAXED (15 min)**: Anti-nag timer for general mood/negativity.
+1. **CRITICAL (0 min)**: **Hard-coded bypass** for Safety Risks.
+2. **URGENT (0 min)**: Immediate action for help requests.
+3. **STANDARD (5 min)**: Normal cooldown for conflicts/events.
+4. **RELAXED (15 min)**: Anti-nag timer for general mood/negativity.
 
 ### Intervention Policy
-The Planner asks Gemini: *"Based on this state, should Echo intervene?"*
+The Planner typically asks Gemini 3: *"Based on this state, should Echo intervene?"*
 
-**Decision Rules (System Prompt):**
-- **Action**: `POST_SUMMARY` (Public) or `DM_MODERATOR` (Private) or `DO_NOTHING`.
-- **Targeting**: 
-  1. Prefer **Source Channel** (where conflict happened).
-  2. Fallback to **Preferred Channels** (`#general`, `#chat`) only for server-wide issues.
-- **Tone**: Neutral, forward-looking, "facilitation over moderation".
-- **Blast Radius**: Minimize impact. Don't post to #general for a 2-person dispute in #off-topic.
+**⚠️ CRITICAL SAFETY OVERRIDE:**
+If `SAFETY_RISK` is detected, the **LLM IS BYPASSED COMPLETELY**.
+*   **Action:** `DM_MODERATOR` (Private Alert)
+*   **Reason:** Safety is non-negotiable. We do not risk LLM hallucination or "hesitation" in safety scenarios.
+*   **Result:** 100% reliable alert delivery.
+
+**For non-safety events (Conflict/Mood):**
+*   **Action**: `POST_SUMMARY` (Public) or `DM_MODERATOR` (Private) or `DO_NOTHING`.
+*   **Targeting**: 
+    1. Prefer **Source Channel** (where conflict happened).
+    2. Fallback to **Preferred Channels** (`#general`, `#chat`) only for server-wide issues.
+*   **Tone**: Neutral, forward-looking, "facilitation over moderation".
+*   **Blast Radius**: Minimize impact. Don't post to #general for a 2-person dispute in #off-topic.
 
 ---
 

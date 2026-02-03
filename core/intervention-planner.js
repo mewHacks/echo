@@ -34,6 +34,7 @@ const { debugLog } = require('../utils/debugging');
 const { getDiscordClient, isClientReady } = require('../discord-client');
 const { PermissionsBitField } = require('discord.js');
 const { GEMINI_TEXT_MODEL } = require('../config/models');
+const { getGuildSettings } = require('./guild-settings');
 
 // ============================================================================
 // CONFIGURATION
@@ -48,7 +49,7 @@ const COOLDOWNS = {
 
 /** @type {{ [key: string]: keyof typeof COOLDOWNS }} */
 const TRIGGER_TIERS = {
-    'HELP_REQUEST': 'STANDARD',
+    'HELP_REQUEST': 'URGENT',
     'SAFETY_RISK': 'URGENT',
     'CONFLICT': 'STANDARD',
     'mood_negative': 'RELAXED',
@@ -58,7 +59,7 @@ const TRIGGER_TIERS = {
 
 // Minimum confidence required to execute an action
 // Below this threshold, the decision is logged but not executed
-const MIN_CONFIDENCE = 0.6;
+const MIN_CONFIDENCE = 0.4;
 
 // In-memory cooldown tracking
 // Key: guildId, Value: { timestamp: number, type: string }
@@ -237,6 +238,15 @@ Output STRICT JSON only:
  */
 async function triggerIntervention(guildId, triggers, state) {
 
+    const guildSettings = await getGuildSettings(guildId);
+    const channelMessageEnabled = guildSettings.channelMessage;
+    const adminDmEnabled = guildSettings.adminDm;
+
+    if (!channelMessageEnabled && !adminDmEnabled) {
+        debugLog(`[Planner] All intervention outputs disabled for ${guildId}, skipping.`);
+        return null;
+    }
+
     // Determine highest priority trigger and its cooldown
     let cooldownTier = 'RELAXED'; // Default to relaxed
     let requiredCooldown = COOLDOWNS.RELAXED;
@@ -276,6 +286,43 @@ async function triggerIntervention(guildId, triggers, state) {
 
     console.log(`[Planner] Evaluating intervention for ${guildId}`, triggers);
 
+    // CRITICAL SAFETY OVERRIDE:
+    // If a SAFETY_RISK is detected (via regex in analyzer.js), we MUST alert moderators immediately.
+    // We do NOT rely on Gemini's judgment here because safety is non-negotiable.
+    if (triggers.includes('SAFETY_RISK')) {
+        debugLog('[Planner] SAFETY_RISK detected. Bypassing Gemini to force DM_MODERATOR.');
+
+        // Find the user who triggered it (if any)
+        const safetyEvent = state.recentEvents?.find(e => e.type === 'SAFETY_RISK');
+        const riskyUser = safetyEvent?.user ? ` (User: ${safetyEvent.user})` : '';
+
+        // Cast to InterventionDecision to fix lint error about 'string' vs union type
+        /** @type {InterventionDecision} */
+        const decision = {
+            action: 'DM_MODERATOR',
+            content: `🚨 **URGENT SAFETY ALERT** 🚨\nSafety keywords were detected in <#${state.sourceChannelId}>${riskyUser}.\nPlease check the channel immediately.`,
+            reasoning: 'Hard-coded safety enforcement bypass.',
+            confidence: 1.0,
+            executed: false // will be set to true in execution block
+        };
+
+        // Execute immediately
+        if (adminDmEnabled) {
+            try {
+                const guild = getDiscordClient().guilds.cache.get(guildId);
+                if (guild) {
+                    await sendModeratorDMs(guild, decision.content, state.sourceChannelId || 'unknown', safetyEvent?.user);
+                    decision.executed = true;
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        // Log and return
+        await logIntervention(guildId, triggers, decision);
+        cooldowns.set(guildId, { timestamp: Date.now(), type: cooldownTier });
+        return decision;
+    }
+
     // Build the context prompt for Gemini
     const contextPrompt = buildContextPrompt(state, triggers);
 
@@ -306,78 +353,126 @@ async function triggerIntervention(guildId, triggers, state) {
                 rawText = result.response.text();
             }
             // Shape 3: Raw API response with candidates array
-            else if (result.candidates && result.candidates[0] && result.candidates[0].content) {
+            else if (result.candidates?.length > 0 && result.candidates[0]?.content?.parts?.[0]?.text) {
                 rawText = result.candidates[0].content.parts[0].text;
             }
             // Shape 4: Hybrid (response.candidates)
-            else if (result.response && result.response.candidates) {
+            else if (result.response?.candidates?.length > 0 && result.response.candidates[0]?.content?.parts?.[0]?.text) {
                 rawText = result.response.candidates[0].content.parts[0].text;
             }
 
             if (!rawText) {
                 console.warn('[Planner] Gemini returned empty response. Keys:', Object.keys(result), 'Response keys:', result.response ? Object.keys(result.response) : 'N/A');
-                decision = { action: 'DO_NOTHING', reasoning: 'Empty Gemini response', confidence: 0 };
+
+                // FALLBACK: If this was a safety risk, we CANNOT fail silently.
+                // If Gemini refuses to speak (safety block) or errors out, we must act.
+                if (triggers.includes('SAFETY_RISK')) {
+                    console.warn('[Planner] Fallback: Forcing Safety Intervention due to empty Gemini response.');
+                    decision = {
+                        action: 'DM_MODERATOR',
+                        content: '⚠️ **Fallback Alert**: Safety system detected a high-risk keyword (Safety Risk), but the AI decision engine failed to respond (possibly due to content safety filters). Access the channel immediately to investigate.',
+                        reasoning: 'Fallback enforcement for safety risk',
+                        confidence: 1.0
+                    };
+                } else {
+                    decision = { action: 'DO_NOTHING', reasoning: 'Empty Gemini response', confidence: 0 };
+                }
             } else {
                 decision = JSON.parse(rawText);
             }
         } catch (parseErr) {
             console.error('[Planner] Failed to parse Gemini response. Error:', /** @type {Error} */(parseErr).message, 'Result keys:', Object.keys(result || {}));
-            decision = { action: 'DO_NOTHING', reasoning: 'Parse error', confidence: 0 };
+
+            // FALLBACK for Parse Errors too
+            if (triggers.includes('SAFETY_RISK')) {
+                console.warn('[Planner] Fallback: Forcing Safety Intervention due to parse error.');
+                decision = {
+                    action: 'DM_MODERATOR',
+                    content: '⚠️ **Fallback Alert**: Safety system detected a high-risk keyword, but the AI response could not be parsed. Better safe than sorry - please investigate.',
+                    reasoning: 'Fallback enforcement for parse error',
+                    confidence: 1.0
+                };
+            } else {
+                decision = { action: 'DO_NOTHING', reasoning: 'Parse error', confidence: 0 };
+            }
         }
 
         debugLog(`[Planner] Decision for ${guildId}:`, decision);
 
         // Execute action if confidence threshold met
         if (decision.action === 'POST_SUMMARY' && decision.confidence >= MIN_CONFIDENCE) {
-            // Post to Discord using the client singleton
-            try {
-                if (!isClientReady()) {
-                    console.warn('[Planner] Discord client not ready, skipping post');
-                    decision.executed = false;
-                } else {
-                    const client = getDiscordClient();
-                    const guild = client.guilds.cache.get(guildId);
-
-                    if (!guild) {
-                        console.warn(`[Planner] Guild ${guildId} not found in cache`);
+            if (!channelMessageEnabled) {
+                debugLog('[Planner] Channel interventions disabled; skipping POST_SUMMARY send.');
+                decision.executed = false;
+            } else {
+                // Post to Discord using the client singleton
+                try {
+                    if (!isClientReady()) {
+                        console.warn('[Planner] Discord client not ready, skipping post');
                         decision.executed = false;
                     } else {
-                        // Find the best channel to post to
-                        const targetChannel = findBestChannel(guild, state);
+                        const client = getDiscordClient();
+                        const guild = client.guilds.cache.get(guildId);
 
-                        if (targetChannel) {
-                            // Format the message with Echo's personality
-                            const message = formatInterventionMessage(decision.content, state);
-                            await targetChannel.send(message);
-
-                            console.log(`[Planner] Posted to #${targetChannel.name} in ${guild.name}`);
-                            decision.executed = true;
-                            decision.channelId = targetChannel.id;
-                        } else {
-                            console.warn(`[Planner] No suitable channel found in ${guild.name}`);
+                        if (!guild) {
+                            console.warn(`[Planner] Guild ${guildId} not found in cache`);
                             decision.executed = false;
+                        } else {
+                            // Find the best channel to post to
+                            const targetChannel = findBestChannel(guild, state);
+
+                            if (targetChannel) {
+                                // Format the message with Echo's personality
+                                const message = formatInterventionMessage(decision.content, state);
+                                await targetChannel.send(message);
+
+                                console.log(`[Planner] Posted to #${targetChannel.name} in ${guild.name}`);
+                                decision.executed = true;
+                                decision.channelId = targetChannel.id;
+                            } else {
+                                console.warn(`[Planner] No suitable channel found in ${guild.name}`);
+                                decision.executed = false;
+                            }
                         }
                     }
+                } catch (discordErr) {
+                    console.error('[Planner] Failed to post to Discord:', /** @type {Error} */(discordErr).message);
+                    decision.executed = false;
                 }
-            } catch (discordErr) {
-                console.error('[Planner] Failed to post to Discord:', /** @type {Error} */(discordErr).message);
-                decision.executed = false;
             }
         } else if (decision.action === 'DM_MODERATOR' && decision.confidence >= 0.7) {
-            // Private alert to moderators
-            try {
-                if (isClientReady()) {
-                    const client = getDiscordClient();
-                    const guild = client.guilds.cache.get(guildId);
-                    if (guild) {
-                        await sendModeratorDMs(guild, decision.content);
-                        decision.executed = true;
-                        console.log(`[Planner] DM_MODERATOR executed for ${guild.name}`);
-                    }
-                }
-            } catch (dmErr) {
-                console.error('[Planner] Failed to execute DM_MODERATOR:', /** @type {Error} */(dmErr).message);
+            if (!adminDmEnabled) {
+                debugLog('[Planner] Admin/mod DMs disabled; skipping DM_MODERATOR send.');
                 decision.executed = false;
+            } else {
+                // Private alert to moderators
+                try {
+                    if (isClientReady()) {
+                        const client = getDiscordClient();
+                        const guild = client.guilds.cache.get(guildId);
+                        if (guild) {
+                            // Try to find the user associated with the triggers
+                            // We look for an event that matches one of the active triggers and has a user field
+                            let targetUser = undefined;
+                            if (state.recentEvents) {
+                                for (const t of triggers) {
+                                    const event = state.recentEvents.find((/** @type {any} */ e) => e.type === t && e.user);
+                                    if (event) {
+                                        targetUser = event.user;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            await sendModeratorDMs(guild, decision.content, state.sourceChannelId || decision.channelId, targetUser);
+                            decision.executed = true;
+                            console.log(`[Planner] DM_MODERATOR executed for ${guild.name} (User: ${targetUser})`);
+                        }
+                    }
+                } catch (dmErr) {
+                    console.error('[Planner] Failed to execute DM_MODERATOR:', /** @type {Error} */(dmErr).message);
+                    decision.executed = false;
+                }
             }
         } else {
             decision.executed = false;
@@ -441,13 +536,15 @@ Based on this state, should Echo intervene?
  */
 async function logIntervention(guildId, triggers, decision) {
     try {
+        // Truncate trigger string to fit in column (assuming VARCHAR(255))
+        const triggerStr = triggers.join(',').substring(0, 255);
         await pool.execute(
             `INSERT INTO intervention_history 
                 (guild_id, trigger_type, action_taken, reasoning, confidence)
              VALUES (?, ?, ?, ?, ?)`,
             [
                 guildId,
-                triggers.join(','),
+                triggerStr,
                 decision.action,
                 decision.reasoning,
                 decision.confidence,
@@ -497,8 +594,10 @@ function clearCooldown(guildId) {
  * Send DM to all moderators
  * @param {Guild} guild - Discord guild
  * @param {string} content - Message content
+ * @param {string} channelId - ID of the channel where the alert originated
+ * @param {string} [username] - Optional username of the user involved
  */
-async function sendModeratorDMs(guild, content) {
+async function sendModeratorDMs(guild, content, channelId, username) {
     try {
         // Fetch members to ensure cache is populated (important for permissions)
         await guild.members.fetch();
@@ -512,7 +611,8 @@ async function sendModeratorDMs(guild, content) {
             )
         );
 
-        const dmMessage = `🔔 **Echo Alert**\n${content}\n\n*No action taken by bot - this is a private heads-up.*`;
+        const userLine = username ? `**Related User:** \`${username}\`\n` : '';
+        const dmMessage = `🔔 **Echo Alert: <#${channelId}>**\n${userLine}${content}\n\n*No action taken by bot - this is a private heads-up.*`;
 
         let sentCount = 0;
         for (const [, mod] of moderators) {

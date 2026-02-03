@@ -1,0 +1,12 @@
+{
+    "folders": [
+        {
+            "name": "MEE7-bot",
+            "path": "."
+        },
+        {
+            "name": "MEE7-bot-console",
+            "path": "../MEE7-bot-console"
+        }
+    ]
+}

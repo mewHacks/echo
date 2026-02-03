@@ -35,6 +35,7 @@ const PCM_MIME_TYPE = 'audio/pcm;rate=48000'; // PCM audio format for sending to
 const STAGE_SPEAK_PROMPT = 'Discord still suppresses Echo in this stage channel. Please use "Invite to Speak" or grant the bot Stage Moderator permissions so its audio can be heard.'; // Warning message for stage channels where bot can't speak
 const IDLE_TIMEOUT_MS = 60_000; // Idle timeout to disconnect after 60 seconds of silence
 const HANGUP_KEYWORD = '<<<TERMINATE_SESSION>>>'; // Unique hangup detection keyword for text summaries
+const PERIODIC_ANALYSIS_INTERVAL_MS = 30_000; // Run background conflict analysis every 30 seconds (Faster sensitive check)
 
 const CALL_END_INSTRUCTION = `
 CRITICAL HANGUP PROTOCOL:
@@ -260,6 +261,7 @@ class VoiceSession {
       'Each turn should be a single concise spoken response — do not repeat the same sentence twice or restate the same idea back-to-back.',
       'IMPORTANT: In this Voice Mode, you CANNOT use tools (Search, etc). If asked to search or perform an action, politely explain you can only do that in Text Chat.',
       'End each spoken response cleanly—never repeat the final word or phrase out loud unless a user explicitly said it that way.',
+      'TRANSCRIPT Log: For every turn, output a text summary of what the user said and your response. Do not output internal thought processes. Format: "User: [summary] | Echo: [response]"',
       CALL_END_INSTRUCTION,
     ].join('\n');
 
@@ -554,7 +556,7 @@ class VoiceSession {
   /* GEMINI COMMUNICATIONS */
 
   // Sends initial instructions to Gemini when WebSocket opens
-  // "primes" the model with context about hangup detection
+  // "primes" the model for Silent Guardian mode
   sendInitialInstructions() {
 
     // If no live session, do nothing
@@ -567,19 +569,51 @@ class VoiceSession {
             role: 'user',
             parts: [
               {
-                text: `Voice link ready. ${CALL_END_INSTRUCTION} Keep replies concise and natural. If anyone says "goodbye" or similar, acknowledge them politely.`,
+                text: `You are Echo, a "Silent Guardian" in a group voice chat.
+${CALL_END_INSTRUCTION}
+
+YOUR BEHAVIOR:
+1. MONITOR MODE (Default): Listen silently. Do NOT reply to casual conversation, banter, laughter, or gaming excitement.
+2. INTERVENTION MODE: Speak ONLY if you detect:
+   - Genuine AGGRESSION (shouting, threats, personal attacks)
+   - SAFETY RISKS (self-harm, doxxing, harassment)
+   - Direct requests for help (e.g. "Echo, help", "Echo, stop them")
+
+If you intervene:
+- Be brief (under 15 words).
+- Be calm and authoritative.
+- Example: "Let's pause and take a breath, everyone."
+- Do NOT be chatty. Do NOT try to join the conversation.
+
+If the conversation is safe, stay silent.`,
               },
             ],
           },
         ],
       });
-      debugVoice('Sent hangup detection instructions to Gemini');
+      debugVoice('Sent "Silent Guardian" instructions to Gemini');
     } catch (err) { // Error handling for synchronous WebSocket send failures
       console.error('[VoiceSession] Failed to seed live session:', err);
     }
   }
 
   // Forwards a PCM audio chunk to Gemini
+  // NOTE: This is a pass-through stream. Audio is NOT stored.
+  // The buffer is immediately forwarded to the API and then dereferenced.
+  processAudioFrame(pcmBuffer) {
+    if (!this.liveSession) return;
+
+    try {
+      this.liveSession.sendRealtimeInput([{
+        mimeType: "audio/pcm;rate=16000",
+        data: pcmBuffer.toString("base64")
+      }]);
+      // Explicitly noting that we do not save the buffer
+      // debugVoice('Audio chunk processed (Ephemeral: Not Stored)'); 
+    } catch (err) {
+      console.error('[VoiceSession] Failed to send audio frame:', err);
+    }
+  }
   // VoiceSession does not care who spoke, just forwards raw audio stream
   // @param {Buffer} chunk - PCM audio data (48kHz mono) 
   forwardPcmChunk(chunk) {
@@ -908,7 +942,17 @@ Return only the number, nothing else. Examples:
       // Manual Safety Trigger (Segment-based)
       // We removed the full-history scan from server-state.js to prevent duplicates.
       // Now we assume if the current chunk mentions danger, it's urgent.
-      const safetyKeywords = ['stalker', 'stalking', 'harassment', 'suicide', 'self-harm', 'call the police', 'danger'];
+      // Multilingual: EN + ZH + ES + JP common terms
+      const safetyKeywords = [
+        // English
+        'stalk', 'suicid', 'self-harm', 'harassment', 'call the police', 'danger', 'kill', 'die',
+        // Chinese
+        '自杀', '跟踪', '死', '杀', '骚扰', '想死', '不想活',
+        // Spanish
+        'suicidio', 'acoso', 'matar',
+        // Japanese
+        '自殺', 'ストーカー', '殺'
+      ];
       if (safetyKeywords.some(kw => trimmed.toLowerCase().includes(kw))) {
         console.log('[VoiceSession] Urgent Safety Keyword detected in live segment:', trimmed);
         // Force push SAFETY_RISK if not already present
@@ -1273,6 +1317,196 @@ Summary: "${summary.slice(0, 500)}"
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
+    }
+  }
+
+  /* PERIODIC CONFLICT ANALYSIS */
+
+  /**
+   * Starts the periodic background analysis timer
+   * This runs every 45 seconds to detect conflicts during continuous conversations
+   * without interrupting the voice stream
+   */
+  startPeriodicAnalysis() {
+
+    // Clear any existing timer
+    if (this.periodicAnalysisTimer) {
+      clearInterval(this.periodicAnalysisTimer);
+    }
+
+    // Start the periodic analysis timer
+    this.periodicAnalysisTimer = setInterval(() => {
+      // Only run if session is active and not destroyed
+      if (!this.destroyed && !this.isReconnecting) {
+        void this.runPeriodicConflictAnalysis();
+      }
+    }, PERIODIC_ANALYSIS_INTERVAL_MS);
+
+    debugVoice('Started periodic conflict analysis timer', { intervalMs: PERIODIC_ANALYSIS_INTERVAL_MS });
+  }
+
+  /**
+   * Runs background conflict analysis on accumulated voice summaries
+   * This uses a SEPARATE Gemini API call (not the voice stream) to analyze
+   * the conversation without interrupting users
+   */
+  async runPeriodicConflictAnalysis() {
+    // Skip if no accumulated summary to analyze
+    if (!this.sessionSummaryBuffer || this.sessionSummaryBuffer.length < 50) {
+      debugVoice('Skipping periodic analysis: insufficient buffer');
+      return;
+    }
+
+    // Skip if buffer hasn't changed since last analysis (avoid duplicate work)
+    if (this.sessionSummaryBuffer === this.lastPeriodicAnalysisBuffer) {
+      debugVoice('Skipping periodic analysis: buffer unchanged');
+      return;
+    }
+
+    try {
+      debugVoice('Running periodic conflict analysis...');
+
+      // Mark buffer as analyzed
+      this.lastPeriodicAnalysisBuffer = this.sessionSummaryBuffer;
+
+      // Lazy load dependencies
+      const { getGeminiClient } = require('./gemini-client');
+      const { GEMINI_TEXT_MODEL } = require('./config/models');
+      const { updateServerState, checkTriggers, setContextMarker } = require('./core/server-state');
+
+      const ai = getGeminiClient();
+
+      // Analyze the accumulated conversation for conflict indicators
+      const analysisPrompt = `Analyze this voice conversation excerpt and identify if there are signs of:
+1. CONFLICT: Disagreement, arguing, raised tensions between participants
+2. STRESS: Someone under pressure, frustrated, or overwhelmed
+3. HELP_REQUEST: Someone asking for help or in distress
+
+Conversation excerpt:
+"${this.sessionSummaryBuffer.slice(-1000)}"
+
+Respond in this EXACT JSON format:
+{
+  "hasConflict": true/false,
+  "conflictConfidence": 0.0-1.0,
+  "hasStress": true/false,
+  "stressConfidence": 0.0-1.0,
+  "hasHelpRequest": true/false,
+  "overallMood": -1.0 to 1.0 (negative = tense, positive = friendly),
+  "summary": "brief 10-word description of the conversation tone"
+}
+
+Return ONLY the JSON, no explanation.`;
+
+      const result = await ai.models.generateContent({
+        model: GEMINI_TEXT_MODEL,
+        contents: [{ role: 'user', parts: [{ text: analysisPrompt }] }],
+      });
+
+      // Parse the JSON response
+      const responseText = result.text?.trim() || '';
+      let analysis;
+      try {
+        // Extract JSON from response (in case there's extra text)
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        analysis = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+      } catch (parseErr) {
+        debugVoice('Failed to parse periodic analysis response:', responseText);
+        return;
+      }
+
+      if (!analysis) return;
+
+      console.log('[VoiceSession] Periodic analysis result:', analysis);
+
+      // Update server state with analysis results
+      const guildId = this.voiceChannel.guild.id;
+
+      // Update mood if we got a valid score
+      if (typeof analysis.overallMood === 'number') {
+        await updateServerState(guildId, {
+          moodScore: analysis.overallMood,
+          source: 'voice',
+          confidence: 0.6, // Lower confidence than real-time analysis
+        });
+      }
+
+      // Set context markers for detected issues
+      if (analysis.hasConflict) {
+        // High Confidence (>0.8) -> Active Voice Intervention
+        if (analysis.conflictConfidence >= 0.8) {
+          console.log(`[VoiceSession] 🔴 HIGH CONFLICT DETECTED (Conf: ${analysis.conflictConfidence}). Queuing Voice Intervention.`);
+          this.queueVoiceIntervention("Let's pause for a moment. Things are getting heated.");
+        }
+
+        // Moderate Confidence (>0.4) -> Record marker
+        if (analysis.conflictConfidence >= 0.4) {
+          await setContextMarker(guildId, {
+            type: 'voice_tension',
+            confidence: analysis.conflictConfidence,
+            topic: analysis.summary || 'voice conflict detected',
+            ttlMs: 15 * 60 * 1000, // 15 minutes
+          });
+        }
+      }
+
+      if (analysis.hasStress && analysis.stressConfidence >= 0.4) {
+        await setContextMarker(guildId, {
+          type: 'high_stress_period',
+          confidence: analysis.stressConfidence,
+          topic: analysis.summary || 'stress detected in voice',
+          ttlMs: 20 * 60 * 1000, // 20 minutes
+        });
+      }
+
+      // Check if text intervention needed (Standard Logic)
+      // This handles the "Post Summary" part automatically if triggers exist
+      const state = await require('./core/server-state').getServerState(guildId);
+      const triggers = checkTriggers(state);
+
+      if (triggers.length > 0) {
+        debugVoice('Periodic analysis found triggers:', triggers);
+
+        // Execute intervention (posts to text channel if needed) 
+        const { triggerIntervention } = require('./core/intervention-planner');
+        await triggerIntervention(guildId, triggers, state);
+      }
+
+    } catch (err) {
+      // Non-critical: periodic analysis failure shouldn't break voice session
+      console.error('[VoiceSession] Periodic conflict analysis failed:', err.message);
+    }
+  }
+
+  /**
+   * Safely injects a voice message (VAD-Aware)
+   * Only speaks if NO ONE is currently speaking to avoid rude interruptions
+   * @param {string} content - What the bot should say
+   */
+  queueVoiceIntervention(content) {
+    if (!this.liveSession) return;
+
+    // VAD Check: If anyone is speaking, ABORT intervention (Silent Guardian rule)
+    // We rely on UserAudioReceiver's activeSpeaker tracking
+    const isUserSpeaking = this.userAudioReceiver && this.userAudioReceiver.activeSpeaker;
+
+    if (isUserSpeaking) {
+      debugVoice('⚠️ Skipping Voice Intervention: User is speaking.', { user: this.userAudioReceiver.activeSpeaker });
+      return;
+    }
+
+    try {
+      debugVoice('🗣️ Injecting Voice Intervention:', content);
+      this.liveSession.sendClientContent({
+        turns: [{
+          role: 'user',
+          parts: [{
+            text: `SYSTEM COMMAND: Please say the following phrase exactly, with a calm, authoritative, de-escalating tone: "${content}"`
+          }]
+        }]
+      });
+    } catch (err) {
+      console.error('[VoiceSession] Failed to inject voice intervention:', err);
     }
   }
 

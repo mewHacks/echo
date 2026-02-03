@@ -1,6 +1,10 @@
 // scripts/dashboard.js
 // Live CLI Dashboard for echo intelligence
-// Run in another terminal: node scripts/dashboard.js 
+// Run in another terminal: node scripts/dashboard.js
+// Options:
+//   --list          Show available guilds and exit
+//   --guild <id>    Filter dashboard to specific guild
+//   (no args)       Show all guilds (default)
 
 require('dotenv').config();
 const { pool } = require('../db');
@@ -17,6 +21,24 @@ const C = {
     CYAN: '\x1b[36m',
 };
 
+// Parse command line arguments
+function parseArgs() {
+    // Get command line arguments and initialize options
+    const args = process.argv.slice(2);
+    const options = { guildId: null, listGuilds: false };
+
+    // For each argument, check if it matches a known option
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--list') {
+            options.listGuilds = true;
+        } else if (args[i] === '--guild' && args[i + 1]) {
+            options.guildId = args[i + 1];
+            i++; // Skip next arg
+        }
+    }
+    return options;
+}
+
 // ============================================================================
 // TYPE DEFINITIONS
 // ============================================================================
@@ -30,85 +52,145 @@ const C = {
  * @property {Array<{trigger_type: string, action_taken: string, reasoning: string, confidence: number, created_at: Date}>} interventions - Intervention history
  */
 
-// Fetch data from DB
-/**
- * @returns {Promise<DashboardData>}
- */
-async function fetchStats() {
+// ============================================================================
+// DATABASE QUERIES
+// ============================================================================
 
-    // Get a DB connection from the pool
+/**
+ * Fetch list of known guilds from server_state table
+ * @returns {Promise<Array<{guild_id: string, updated_at: Date}>>}
+ */
+async function fetchGuilds() {
     const conn = await pool.getConnection();
     try {
+        const [rows] = await conn.query(
+            'SELECT guild_id, mood_score, updated_at FROM server_state ORDER BY updated_at DESC'
+        );
+        return rows;
+    } finally {
+        conn.release();
+    }
+}
 
-        // Compute today's date (used for daily_stats lookup)
+/**
+ * Fetch dashboard data, optionally filtered by guild
+ * @param {string|null} guildId - Guild ID to filter by, or null for all guilds
+ * @returns {Promise<DashboardData>}
+ */
+async function fetchStats(guildId = null) {
+    const conn = await pool.getConnection();
+    try {
         const today = new Date().toISOString().slice(0, 10);
 
-        // Daily stats that shows high-level health metrics for today (messages, users, sentiment)
+        // Daily stats - filter by guild if provided
         /** @type {any[]} */
-        const [stats] = await conn.query(
-            'SELECT * FROM daily_stats WHERE date = ? ORDER BY message_count DESC LIMIT 1',
-            [today]
-        );
+        const [stats] = guildId
+            ? await conn.query(
+                'SELECT * FROM daily_stats WHERE date = ? AND guild_id = ? LIMIT 1',
+                [today, guildId]
+            )
+            : await conn.query(
+                'SELECT * FROM daily_stats WHERE date = ? ORDER BY message_count DESC LIMIT 1',
+                [today]
+            );
 
-        // Emerging topics (top 5) that shows what is the server is talking about rn with decay score
+        // Emerging topics - filter by guild if provided
         /** @type {any[]} */
-        const [topics] = await conn.query(
-            'SELECT topic, score FROM emerging_topics ORDER BY score DESC LIMIT 5'
-        );
+        const [topics] = guildId
+            ? await conn.query(
+                'SELECT topic, score FROM emerging_topics WHERE guild_id = ? ORDER BY score DESC LIMIT 5',
+                [guildId]
+            )
+            : await conn.query(
+                'SELECT topic, score FROM emerging_topics ORDER BY score DESC LIMIT 5'
+            );
 
-        // Recent observations that shows discrete AI-detected events (conflicts, spikes, anomalies)
+        // Recent observations - no guild_id column, always global
         /** @type {any[]} */
         const [obs] = await conn.query(
             'SELECT type, data, confidence, created_at FROM observations ORDER BY created_at DESC LIMIT 5'
         );
 
-        // Server states (mood/trend per guild)
+        // Server states - filter by guild if provided
         /** @type {any[]} */
-        const [serverStates] = await conn.query(
-            'SELECT guild_id, mood_score, mood_trend, dominant_signal, updated_at FROM server_state ORDER BY updated_at DESC LIMIT 3'
-        );
+        const [serverStates] = guildId
+            ? await conn.query(
+                'SELECT guild_id, mood_score, mood_trend, dominant_signal, updated_at FROM server_state WHERE guild_id = ?',
+                [guildId]
+            )
+            : await conn.query(
+                'SELECT guild_id, mood_score, mood_trend, dominant_signal, updated_at FROM server_state ORDER BY updated_at DESC LIMIT 3'
+            );
 
-        // Recent interventions (decisions + reasoning)
+        // Recent interventions - filter by guild if provided
         /** @type {any[]} */
-        const [interventions] = await conn.query(
-            'SELECT trigger_type, action_taken, reasoning, confidence, created_at FROM intervention_history ORDER BY created_at DESC LIMIT 5'
-        );
+        const [interventions] = guildId
+            ? await conn.query(
+                'SELECT trigger_type, action_taken, reasoning, confidence, created_at FROM intervention_history WHERE guild_id = ? ORDER BY created_at DESC LIMIT 5',
+                [guildId]
+            )
+            : await conn.query(
+                'SELECT trigger_type, action_taken, reasoning, confidence, created_at FROM intervention_history ORDER BY created_at DESC LIMIT 5'
+            );
 
-        // Return normalized dashboard payload
         return {
-            stats: stats[0] || {}, // daily_stats is single-row per day
+            stats: stats[0] || {},
             topics,
             obs,
             serverStates,
             interventions
         };
     } finally {
-        // Always release connection back to pool
         conn.release();
     }
 }
 
-// Render the dashboard to terminal
-function render(data) {
+// ============================================================================
+// RENDER FUNCTIONS
+// ============================================================================
 
-    // Clear screen and reset cursor to top-left
+/**
+ * Display list of available guilds
+ * @param {Array<{guild_id: string, mood_score: number, updated_at: Date}>} guilds
+ */
+function renderGuildList(guilds) {
+    console.log(`\n${C.BRIGHT}${C.CYAN}Available Guilds${C.RESET}\n`);
+    console.log('----------------------------------------------------------');
+
+    if (guilds.length === 0) {
+        console.log(`${C.DIM}(No guilds found in server_state)${C.RESET}`);
+        return;
+    }
+
+    guilds.forEach((g, i) => {
+        const moodColor = g.mood_score > 0.2 ? C.GREEN : g.mood_score < -0.2 ? C.RED : C.YELLOW;
+        const updated = new Date(g.updated_at).toLocaleString();
+        console.log(`${C.BRIGHT}[${i + 1}]${C.RESET} ${g.guild_id} | Mood: ${moodColor}${g.mood_score?.toFixed(2) || '0.00'}${C.RESET} | ${C.DIM}${updated}${C.RESET}`);
+    });
+
+    console.log(`\n${C.DIM}Usage: node scripts/dashboard.js --guild <guild_id>${C.RESET}\n`);
+}
+
+/**
+ * Render the dashboard to terminal
+ * @param {DashboardData} data
+ * @param {string|null} guildId - Currently filtered guild, or null for all
+ */
+function render(data, guildId = null) {
+    // Clear screen and reset cursor
     process.stdout.write('\x1b[2J\x1b[0f');
 
-    // Destructure data (including new fields)
     const { stats, topics, obs, serverStates, interventions } = data;
-
-    // Current time shown in header
     const now = new Date().toLocaleTimeString();
 
-    // Header UI
+    // Header with filter indicator
+    const filterText = guildId ? `Guild: ...${guildId.slice(-6)}` : 'All Guilds';
     console.log(`${C.BRIGHT}${C.CYAN}╔════════════════════════════════════════════════════════╗`);
     console.log(`║               ECHO INTELLIGENCE DASHBOARD              ║`);
-    console.log(`║                  ${C.DIM}${now.padEnd(38)}${C.CYAN}║`);
+    console.log(`║  ${C.YELLOW}${filterText.padEnd(20)}${C.CYAN}              ${C.DIM}${now.padEnd(14)}${C.CYAN}║`);
     console.log(`╚════════════════════════════════════════════════════════╝${C.RESET}\n`);
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Server States Section
-    // ═══════════════════════════════════════════════════════════════════════
     console.log(`${C.BRIGHT}🧠 SERVER STATES${C.RESET}`);
     console.log(`----------------------------------------------------------`);
     if (!serverStates || serverStates.length === 0) {
@@ -117,7 +199,7 @@ function render(data) {
         serverStates.forEach(s => {
             const moodScore = s.mood_score || 0;
             const moodColor = moodScore > 0.2 ? C.GREEN : moodScore < -0.2 ? C.RED : C.YELLOW;
-            const guildShort = s.guild_id.slice(-6); // Last 6 chars of guild ID
+            const guildShort = s.guild_id.slice(-6);
             const trend = s.mood_trend || 'stable';
             const signal = s.dominant_signal || 'text';
             console.log(`Guild ...${guildShort} | Mood: ${moodColor}${moodScore.toFixed(2)}${C.RESET} (${trend}) | Signal: ${signal}`);
@@ -125,9 +207,7 @@ function render(data) {
     }
     console.log('');
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Intervention Log Section
-    // ═══════════════════════════════════════════════════════════════════════
     console.log(`${C.BRIGHT}⚡ INTERVENTION LOG${C.RESET}`);
     console.log(`----------------------------------------------------------`);
     if (!interventions || interventions.length === 0) {
@@ -144,15 +224,17 @@ function render(data) {
     }
     console.log('');
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Today's Pulse
-    // ═══════════════════════════════════════════════════════════════════════
-    console.log(`${C.BRIGHT}📊 TODAY'S PULSE${C.RESET}`);
+    const sentAvg = stats.sentiment_avg || 0;
+    const pulseChars = ['♥', '♡'];
+    const pulseFrame = Math.floor(Date.now() / 1000) % 2; // Beat every second
+    const heart = sentAvg < -0.2 ? C.RED + pulseChars[pulseFrame] : C.GREEN + pulseChars[pulseFrame];
+
+    console.log(`${C.BRIGHT}📊 TODAY'S PULSE ${heart}${C.RESET}`);
     console.log(`----------------------------------------------------------`);
     console.log(`Messages  : ${stats.message_count || 0}`);
     console.log(`Users     : ${stats.active_users || 0}`);
 
-    const sentAvg = stats.sentiment_avg || 0;
     const sentColor = sentAvg > 0.2 ? C.GREEN : sentAvg < -0.2 ? C.RED : C.YELLOW;
     console.log(`Sentiment : ${sentColor}${sentAvg.toFixed(2)}${C.RESET} (Min: ${stats.sentiment_min?.toFixed(2) || 0})`);
 
@@ -160,9 +242,7 @@ function render(data) {
     console.log(`Neg Ratio : ${negColor}${((stats.negative_ratio || 0) * 100).toFixed(1)}%${C.RESET}`);
     console.log('');
 
-    // ═══════════════════════════════════════════════════════════════════════
     // Trending Topics
-    // ═══════════════════════════════════════════════════════════════════════
     console.log(`${C.BRIGHT}🔥 TRENDING TOPICS${C.RESET}`);
     console.log(`----------------------------------------------------------`);
     if (topics.length === 0) console.log(`${C.DIM}(No topics yet)${C.RESET}`);
@@ -174,10 +254,8 @@ function render(data) {
     });
     console.log('');
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Recent Observations
-    // ═══════════════════════════════════════════════════════════════════════
-    console.log(`${C.BRIGHT}👁🗨 RECENT OBSERVATIONS${C.RESET}`);
+    // Recent Observations (always global)
+    console.log(`${C.BRIGHT}👁️ RECENT OBSERVATIONS${C.RESET} ${C.DIM}(global)${C.RESET}`);
     console.log(`----------------------------------------------------------`);
     if (obs.length === 0) console.log(`${C.DIM}(No observations yet)${C.RESET}`);
     obs.forEach(o => {
@@ -199,20 +277,39 @@ function render(data) {
     console.log(`\n${C.DIM}Press Ctrl+C to exit.${C.RESET}`);
 }
 
-// Main loop
-async function main() {
-    console.log('Connecting to database...');
-    try {
-        // Initial fetch immediately on startup
-        const data = await fetchStats();
-        render(data);
+// ============================================================================
+// MAIN
+// ============================================================================
 
-        // Refresh dashboard every 5 secs
+async function main() {
+    const options = parseArgs();
+
+    console.log('Connecting to database...');
+
+    try {
+        // --list mode: show guilds and exit
+        if (options.listGuilds) {
+            const guilds = await fetchGuilds();
+            renderGuildList(guilds);
+            process.exit(0);
+        }
+
+        // Normal dashboard mode
+        const guildId = options.guildId;
+        if (guildId) {
+            console.log(`Filtering to guild: ${guildId}`);
+        }
+
+        // Initial fetch
+        const data = await fetchStats(guildId);
+        render(data, guildId);
+
+        // Refresh dashboard every 5 seconds
         setInterval(async () => {
             try {
-                const data = await fetchStats();
-                render(data);
-            } catch (err) { // If non-fatal error, dashboard continues running
+                const data = await fetchStats(guildId);
+                render(data, guildId);
+            } catch (err) { // If non-fatal error, dashboard continues rendering
                 console.error('Error fetching stats:', err);
             }
         }, 5000); // 5 seconds refresh

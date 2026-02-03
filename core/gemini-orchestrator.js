@@ -28,6 +28,32 @@ const { processAttachments } = require('../utils/attachments');
 const { debugLog, startTimer, logTimingSummary } = require('../utils/debugging');
 const { showConfirmationDialog, clearConfirmationUI } = require('../handlers/confirmation-ui');
 
+/**
+ * Helper to retry operations with exponential backoff
+ * specifically for handling Gemini 503 Overloaded errors
+ * @param {Function} operation - Async function to retry
+ * @param {number} maxRetries - Max attempts (default 3)
+ */
+async function withRetry(operation, maxRetries = 3) {
+  let lastError;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      // Retry on 503 (Overloaded) or 500 (Internal Error) or 429 (Too Many Requests - sometimes transient)
+      if (err.status === 503 || err.code === 503 || err.status === 500 || err.code === 500) {
+        const delay = Math.pow(2, i) * 1000 + (Math.random() * 500);
+        debugLog(`[Gemini] API Error ${err.status || err.code}. Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw err; // Re-throw other errors immediately
+    }
+  }
+  throw lastError;
+}
+
 // Constants
 const MAX_CONTEXT_MESSAGES = 100;
 const SUMMARIZE_THRESHOLD = 50;
@@ -345,7 +371,7 @@ async function runGeminiCore({
     const intent = await detectIntent(promptText);
     debugLog('Detected intent:', intent);
 
-    const chatSystemInstruction = `${BASE_SYSTEM_PROMPT}\n\n${TEXT_MODE_CONTEXT}`;
+    const chatSystemInstruction = `${BASE_SYSTEM_PROMPT}\n\n${TEXT_MODE_CONTEXT}\n\nIMPORTANT: For queries about current events, prices, news, weather, sports, or any time-sensitive information, use the web_search tool to get the latest information. Always search when the user asks about "now", "today", "current", "latest", or "recent".`;
     const actionSystemInstruction = BASE_SYSTEM_PROMPT;
 
     // Call Gemini and handle response
@@ -391,11 +417,11 @@ async function runGeminiCore({
 
       // WRAPPER: Handles both native and manual tool calls
       const generate = async (contents) => {
-        const result = await ai.models.generateContent({
+        const result = await withRetry(() => ai.models.generateContent({
           model: GEMINI_TOOL_MODEL,
           contents,
           config: baseConfig
-        });
+        }));
 
         if (isManualToolMode) {
           try {
@@ -651,27 +677,27 @@ async function runGeminiCore({
         await discordMessage.edit({ content: text, embeds: [], components: [] }).catch(() => { });
       } else if (functionCallCount > 0) {
         // Executed functions but no text yet - stream a final response
-        const streamResult = await ai.models.generateContentStream({
+        const streamResult = await withRetry(() => ai.models.generateContentStream({
           model: GEMINI_TOOL_MODEL,
-          contents: conversationHistory,
+          contents: conversationHistory.map(c => ({ role: c.role, parts: c.parts })),
           config: { systemInstruction },
-        });
+        }));
         text = await handleStreamingResponse(streamResult, discordMessage, { embeds: [], components: [] });
       } else if (isActionFlow) {
         // Action flow but no function call and no text - fallback to chat
-        const streamResult = await ai.models.generateContentStream({
+        const streamResult = await withRetry(() => ai.models.generateContentStream({
           model: GEMINI_TOOL_MODEL,
           contents: [{ role: 'user', parts: chatParts }],
           config: { systemInstruction: chatSystemInstruction },
-        });
+        }));
         text = await handleStreamingResponse(streamResult, discordMessage);
       } else {
         // Regular chat response - stream it
-        const streamResult = await ai.models.generateContentStream({
+        const streamResult = await withRetry(() => ai.models.generateContentStream({
           model: GEMINI_TOOL_MODEL,
           contents: [{ role: 'user', parts: chatParts }],
           config: { systemInstruction: chatSystemInstruction },
-        });
+        }));
         text = await handleStreamingResponse(streamResult, discordMessage);
       }
     } catch (err) {

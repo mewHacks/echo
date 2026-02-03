@@ -52,7 +52,9 @@
  * @typedef {Object} AnalyzerEvent
  * @property {string} type - Event type (CONFLICT, HELP_REQUEST, etc.)
  * @property {string} desc - Event description
+ * @property {string} desc - Event description
  * @property {number} confidence - Confidence score (0.0-1.0)
+ * @property {string} [user] - Optional username associated with the event
  */
 
 /**

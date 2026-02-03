@@ -3,6 +3,7 @@
 
 const { pool } = require('../db');
 const { analyzeGuild } = require('./analyzer');
+const { getGuildSettings } = require('./guild-settings');
 
 // Basic configuration
 const CHECK_INTERVAL_MS = 60 * 1000; // Check every 1 minute
@@ -68,6 +69,13 @@ async function checkGuild(guildId, lastMsgId, lastRunTime) {
     guildLocks.set(guildId, true);
 
     try {
+        const settings = await getGuildSettings(guildId);
+
+        // If background analysis is disabled for this guild, skip quietly
+        if (!settings.backgroundAnalysis) {
+            return;
+        }
+
         // 1. Get Dynamic Thresholds (Updated by Analyzer)
         /** @type {any[]} */
         const [meta] = await pool.query(
@@ -100,10 +108,17 @@ async function checkGuild(guildId, lastMsgId, lastRunTime) {
             `SELECT COUNT(*) as count FROM messages 
              WHERE guild_id = ? AND id > ? 
              AND (
-               content LIKE '%stalking%' OR 
-               content LIKE '%suicide%' OR 
+               content LIKE '%stalk%' OR 
+               content LIKE '%suicid%' OR 
                content LIKE '%self-harm%' OR 
-               content LIKE '%harassment%'
+               content LIKE '%kill%' OR 
+               content LIKE '%die%' OR 
+               content LIKE '%harassment%' OR
+               content LIKE '%自杀%' OR
+               content LIKE '%跟踪%' OR
+               content LIKE '%想死%' OR
+               content LIKE '%不想活%' OR
+               content LIKE '%骚扰%'
              )`,
             [guildId, lastMsgId]
         );

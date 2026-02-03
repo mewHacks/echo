@@ -105,17 +105,15 @@ Echo is an **Automated Intelligence System** for Discord, powered by Google Gemi
 
 **intervention-planner.js**
 - Decides IF and HOW to intervene based on server state triggers.
-- Using Gemini to generate context-aware, empathetic interventions.
-- **Triggers**: `mood_negative`, `CONFLICT`, `HELP_REQUEST`, `voice_activity`.
+- Uses Gemini 3 to generate context-aware interventions, BUT bypasses it for Safety.
+- **Triggers**: `SAFETY_RISK`, `mood_negative`, `CONFLICT`, `HELP_REQUEST`, `voice_activity`.
+- **CRITICAL SAFETY OVERRIDE**: If `SAFETY_RISK` regex triggers, instantly executes `DM_MODERATOR` without asking Gemini.
 - **Smart Cooldowns**:
-  - `HELP_REQUEST` (Safety): 0 min (Immediate)
+  - `SAFETY_RISK`: 0 min (Immediate)
+  - `HELP_REQUEST`: 0 min (Immediate)
   - `CONFLICT`: 5 min (Standard)
   - `mood_negative`: 15 min (Anti-Nag)
-- **Smart Channel Targeting**:
-  - Prefers posting to source channel (where conflict happened)
-  - Falls back to #general only for server-wide context
-  - Uses neutral, forward-looking language (no fault attribution)
-- **Purpose**: The "Reasoned Decision" system.
+- **Purpose**: The "Reasoned Decision" system (with Safety limits).
 
 **memory-tools.js**
 - Provides Gemini-callable tools for on-demand context retrieval.
@@ -268,8 +266,8 @@ Echo is an **Automated Intelligence System** for Discord, powered by Google Gemi
 ## Voice Session Management (`voiceSessionManager.js`)
 
 **Core Responsibilities:**
-- Manages Discord voice connections and Gemini Live integration
-- Handles real-time audio streaming bidirectionally
+- Manages Discord voice connections and **Gemini Live (Gemini 2.5 Flash)** usage.
+- Handles real-time audio streaming bidirectionally using **Ephemeral Privacy** (no storage).
 - Coordinates between Discord voice, Gemini API, and user audio processing
 - **Updates ServerState**: Pushes voice summaries to `server-state.js` for cross-modal awareness.
 
@@ -375,4 +373,4 @@ Echo prioritizes **facilitation over moderation**:
 
 This is a deliberate design choice — "knowing when NOT to act" is intelligence.
 
-Last updated: 2026-01-20
+Last updated: 2026-01-16

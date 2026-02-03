@@ -5,6 +5,7 @@ const { getGeminiClient } = require('../gemini-client');
 const { pool } = require('../db');
 const { debugLog } = require('../utils/debugging');
 const { GEMINI_ANALYZER_MODEL } = require('../config/models'); // Configure model
+const { getGuildSettings } = require('./guild-settings');
 
 // Configure system prompt
 const SYSTEM_PROMPT = `
@@ -23,7 +24,7 @@ Output STRICT JSON with this schema:
     "negative_ratio": "number (0.0 to 1.0)"
   },
   "events": [
-    { "type": "string (e.g. CONFLICT, HELP_REQUEST, SPAM)", "desc": "string summary", "confidence": "number (0.0 to 1.0)" }
+    { "type": "string (e.g. CONFLICT, HELP_REQUEST, SPAM)", "desc": "string summary", "confidence": "number (0.0 to 1.0)", "user": "string (optional username)" }
   ]
 }
 
@@ -35,6 +36,7 @@ Rules:
   - Flag "CONFLICT" for arguments/fights.
   - Flag "HELP_REQUEST" for persistent questions.
   - Flag "SAFETY_RISK" for stalking, harassment, suicide, or self-harm keywords (CRITICAL).
+  - If a specific user is the primary cause (e.g. asking for help, reporting safety risk), include their username in the "user" field.
   - Otherwise leave empty.
 `.trim();
 
@@ -60,6 +62,7 @@ Rules:
  * @property {string} type - Event type (CONFLICT, HELP_REQUEST, etc.)
  * @property {string} desc - Event description
  * @property {number} confidence - Confidence score (0.0 to 1.0)
+ * @property {string} [user] - Optional username associated with the event
  */
 
 /**
@@ -79,6 +82,7 @@ Rules:
  * @property {string} user_id
  * @property {string} username
  * @property {string} content
+ * @property {string} role
  * @property {Date} created_at
  */
 
@@ -87,9 +91,18 @@ Rules:
  * Checks DB for new messages, fetches context (overlap), runs Gemini Analysis and updates cursor & stats
  *
  * @param {string} guildId - Discord guild ID
+ * @param {{ force?: boolean }} [options] - Optional flags (force overrides backgroundAnalysis toggle)
  * @returns {Promise<AnalysisResult|null|undefined>} - Analysis result or null if no new messages
  */
-async function analyzeGuild(guildId) {
+async function analyzeGuild(guildId, options = {}) {
+
+    const force = Boolean(options.force);
+    const settings = await getGuildSettings(guildId);
+
+    if (!force && !settings.backgroundAnalysis) {
+        debugLog(`[Analyzer] Background analysis disabled for guild ${guildId}.`);
+        return null;
+    }
 
     // Get a dedicated db connection for safety
     const conn = await pool.getConnection();
@@ -185,6 +198,36 @@ ${newText}
             // Ensure events is an array to prevent crashes when iterating later
             events: Array.isArray(parsed.events) ? parsed.events : []
         };
+
+        // --- SAFETY FALLBACK: If AI detects nothing (silent due to safety filters), check manually ---
+        // This ensures "stalker" or "suicide" is never ignored just because the model refused to output it.
+        // Multilingual: EN + ZH + ES + JP common terms
+        const safetyPatterns = [
+            // English/Spanish - Word boundaries
+            /\b(stalk|suicid|self-harm|kill|die|harass|suicidio|acoso|matar)\b/i,
+            // Chinese/Japanese - Substring (no spaces)
+            /(自杀|跟踪|死|杀|骚扰|想死|不想活|自殺|ストーカー|殺)/
+        ];
+
+        const hasSafetyKeywords = /** @type {MessageRow[]} */ (newMessages).some(
+            (/** @type {MessageRow} */ msg) => msg.role !== 'assistant' && safetyPatterns.some(pattern => pattern.test(msg.content))
+        );
+
+        if (hasSafetyKeywords) {
+            // Check if AI already caught it
+            const alreadyFlagged = analysis.events.some((/** @type {AnalyzerEvent} */ e) => e.type === 'SAFETY_RISK');
+
+            if (!alreadyFlagged) {
+                console.warn('[Analyzer] Fallback: Manually injecting SAFETY_RISK event (AI missed it or was silent)');
+                analysis.events.push({
+                    type: 'SAFETY_RISK',
+                    desc: 'URGENT: Safety keywords detected in chat (Fallback Detection).',
+                    user: /** @type {MessageRow[]} */ (newMessages).find(
+                        (/** @type {MessageRow} */ m) => m.role !== 'assistant' && safetyPatterns.some(p => p.test(m.content))
+                    )?.username
+                });
+            }
+        }
 
         // Log events if any were detected (CONFLICT, HELP_REQUEST, etc.)
         if (analysis.events.length > 0) {
