@@ -1,6 +1,6 @@
 # Voice System Architecture
 
-**MEE7 Discord Bot - Gemini Live Voice Integration**
+**Echo Discord Bot - Gemini Live Voice Integration**
 
 This document provides a comprehensive overview of the voice chat system, detailing the architecture, responsibilities, and implementation from high-level to low-level components.
 
@@ -668,5 +668,5 @@ The voice system is a well-architected, modular design that successfully bridges
 2. Gather user feedback on voice quality
 3. Evaluate VAD integration (high impact)
 
-Last updated: 2026-01-16
+Last updated: 2026-02-03
 

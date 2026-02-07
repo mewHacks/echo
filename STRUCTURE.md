@@ -373,4 +373,4 @@ Echo prioritizes **facilitation over moderation**:
 
 This is a deliberate design choice — "knowing when NOT to act" is intelligence.
 
-Last updated: 2026-01-16
+Last updated: 2026-02-03

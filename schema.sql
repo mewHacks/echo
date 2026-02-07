@@ -1,9 +1,9 @@
 -- Idempotent schema for Echo bot
 -- This file is safe to re-run: it creates the database and tables if missing
 
-CREATE DATABASE IF NOT EXISTS `mee7` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE DATABASE IF NOT EXISTS `echo` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-USE `mee7`;
+USE `echo`;
 
 -- Channels table for storing channel summaries
 CREATE TABLE IF NOT EXISTS channels (

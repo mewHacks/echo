@@ -1,6 +1,6 @@
 # Intelligence System Architecture
 
-**MEE7 (Echo) - Automated Community Intelligence**
+**Echo - Automated Community Intelligence**
 
 This document details the "Brain" of Echo—how it observes server activity, reasons about community dynamics, and proactively intervenes to maintain healthy conversations.
 
@@ -151,4 +151,4 @@ CREATE TABLE intervention_history (
 3. **Multi-turn Mediation**: Allow Echo to reply to users who respond to its intervention.
 
 ---
-*Last Updated: 2026-01-16*
+*Last Updated: 2026-02-03*
