@@ -1,8 +1,11 @@
-﻿![Echo Banner](assets/echo_banner.png)
+﻿<img src="assets/echo_banner.png" alt="Echo Banner" width="100%" />
+
 # Echo: The Autonomous Community Guardian
 ### Observe. Reason. Act.
 
-[![Watch the Demo](https://img.youtube.com/vi/7-yXKVGEld8/0.jpg)](https://youtu.be/7-yXKVGEld8)
+<iframe width="560" height="315" src="https://youtu.be/7-yXKVGEld8" target="_blank">
+  <img src="https://img.youtube.com/vi/7-yXKVGEld8/maxresdefault.jpg" alt="Watch the Demo" width="100%" />
+</iframe>
 
 ---
 
