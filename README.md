@@ -1,4 +1,4 @@
-﻿![Echo Banner](https://placehold.co/1200x300/2b2d31/ffffff?text=ECHO:+Autonomous+Community+Guardian)
+﻿![Echo Banner](assets/echo_banner.png)
 # Echo: The Autonomous Community Guardian
 ### Observe. Reason. Act.
 
