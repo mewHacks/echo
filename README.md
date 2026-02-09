@@ -4,7 +4,7 @@
 ### Observe. Reason. Act.
 
 <a href="https://youtu.be/7-yXKVGEld8" target="_blank">
-  <img src="https://img.youtube.com/vi/7-yXKVGEld8/maxresdefault.jpg" alt="Watch the Demo" width="100%" />
+  <img src="https://img.youtube.com/vi/7-yXKVGEld8/hqdefault.jpg" alt="Watch the Demo" width="100%" />
 </a>
 
 ---
