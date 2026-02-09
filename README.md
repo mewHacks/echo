@@ -3,9 +3,9 @@
 # Echo: The Autonomous Community Guardian
 ### Observe. Reason. Act.
 
-<iframe width="560" height="315" src="https://youtu.be/7-yXKVGEld8" target="_blank">
+<a href="https://youtu.be/7-yXKVGEld8" target="_blank">
   <img src="https://img.youtube.com/vi/7-yXKVGEld8/maxresdefault.jpg" alt="Watch the Demo" width="100%" />
-</iframe>
+</a>
 
 ---
 
